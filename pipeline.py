@@ -11,6 +11,7 @@ from loguru import logger
 from config import settings
 from models import TradeSignal, Direction, LayerStatus
 from core.exchange_client import exchange_client
+from core.watchlist import watchlist_manager
 from core.supabase_client import supabase_store
 from core.telegram_notifier import send_signal
 
@@ -194,10 +195,11 @@ def process_and_dispatch(symbol: str) -> TradeSignal | None:
 
 
 def scan_watchlist() -> list:
-    """Scan seluruh watchlist, kembalikan list signal yang berhasil dikirim."""
+    """Scan seluruh watchlist saat ini (static atau dynamic), kembalikan list signal yang berhasil dikirim."""
     exchange_client.load_markets()
+    symbols = watchlist_manager.get_symbols()
     sent_signals = []
-    for symbol in settings.watchlist:
+    for symbol in symbols:
         logger.info(f"Scanning {symbol} ...")
         signal = process_and_dispatch(symbol)
         if signal:

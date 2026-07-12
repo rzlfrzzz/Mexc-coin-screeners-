@@ -15,6 +15,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 
 from config import settings, validate_settings
 from pipeline import scan_watchlist
+from core.watchlist import watchlist_manager
 
 
 def configure_logging():
@@ -25,11 +26,12 @@ def configure_logging():
 
 
 def job():
-    logger.info(f"=== Mulai scan watchlist: {settings.watchlist} ===")
+    logger.info(f"=== Mulai scan watchlist ({watchlist_manager.last_refresh_info()}) ===")
     start = time.time()
     signals = scan_watchlist()
     elapsed = time.time() - start
-    logger.info(f"=== Scan selesai dalam {elapsed:.1f}s, {len(signals)} signal terkirim ===")
+    symbols = watchlist_manager.current_symbols()
+    logger.info(f"=== Scan selesai dalam {elapsed:.1f}s untuk {symbols}, {len(signals)} signal terkirim ===")
 
 
 def main():
@@ -43,8 +45,16 @@ def main():
         logger.warning("Bot tetap jalan, tapi fitur terkait mungkin tidak berfungsi penuh. "
                         "Lengkapi file .env sesuai .env.example.")
 
-    logger.info(f"Bot mulai. Interval scan: {settings.scan_interval_seconds}s. "
-                f"Watchlist: {settings.watchlist}")
+    if settings.watchlist_mode == "dynamic":
+        logger.info(
+            f"Watchlist mode: dynamic (top {settings.watchlist_top_n} by volume 24h, "
+            f"refresh tiap {settings.watchlist_refresh_hours}h). Mengambil watchlist awal..."
+        )
+        watchlist_manager.refresh(force=True)
+    else:
+        logger.info(f"Watchlist mode: static. Watchlist: {settings.watchlist}")
+
+    logger.info(f"Bot mulai. Interval scan: {settings.scan_interval_seconds}s.")
 
     # jalankan sekali di awal, lalu terjadwal berkala
     job()

@@ -44,8 +44,9 @@ class Settings:
     # mengarahkan bot ini ke exchange lain - semua layer/threshold di bot ini di-tuning untuk MEXC.
     exchange_id: str = "mexc"
     exchange_market_type: str = "swap"  # "swap" = USDT-M perpetual futures di ccxt
-    exchange_api_key: str = os.getenv("EXCHANGE_API_KEY", "")
-    exchange_api_secret: str = os.getenv("EXCHANGE_API_SECRET", "")
+    # Tidak ada exchange_api_key/exchange_api_secret di sini secara sengaja:
+    # bot ini hanya memanggil endpoint publik (OHLCV, ticker, order book),
+    # jadi tidak butuh API key/secret exchange sama sekali.
     # CATATAN: MEXC tidak menyediakan sandbox/testnet di ccxt (ex.urls['test'] kosong).
     # Kalau di-set True, bot akan crash saat start. Dibiarkan False permanen, opsi di .env diabaikan
     # dan hanya dipakai untuk menampilkan warning ke user.
@@ -55,6 +56,15 @@ class Settings:
     watchlist: list = field(default_factory=lambda: _get_list(
         "WATCHLIST_SYMBOLS", ["BTC/USDT:USDT", "ETH/USDT:USDT"]
     ))
+
+    # Mode watchlist:
+    # - "static"  -> selalu pakai WATCHLIST_SYMBOLS apa adanya
+    # - "dynamic" -> auto top-N symbol by volume 24h (quoteVolume), refresh berkala.
+    #                WATCHLIST_SYMBOLS tetap dipakai sebagai fallback awal/kalau fetch gagal.
+    watchlist_mode: str = os.getenv("WATCHLIST_MODE", "static")
+    watchlist_top_n: int = _get_int("WATCHLIST_TOP_N", 20)
+    watchlist_refresh_hours: float = _get_float("WATCHLIST_REFRESH_HOURS", 12)
+    watchlist_quote: str = os.getenv("WATCHLIST_QUOTE", "USDT")
 
     tf_htf: str = os.getenv("TF_HTF", "4h")   # untuk Layer 2 (trend besar)
     tf_mtf: str = os.getenv("TF_MTF", "1h")   # untuk Layer 3-7 (struktur, SMC, momentum, volume)
@@ -123,6 +133,12 @@ def validate_settings() -> list:
                 f"WATCHLIST_SYMBOLS '{sym}' bukan format perpetual futures ccxt yang valid "
                 f"(harus 'BASE/QUOTE:QUOTE', contoh 'BTC/USDT:USDT')"
             )
+    if settings.watchlist_mode not in ("static", "dynamic"):
+        problems.append(
+            f"WATCHLIST_MODE '{settings.watchlist_mode}' tidak valid, harus 'static' atau 'dynamic'"
+        )
+    if settings.watchlist_mode == "dynamic" and settings.watchlist_top_n <= 0:
+        problems.append("WATCHLIST_TOP_N harus > 0 kalau WATCHLIST_MODE=dynamic")
     if settings.exchange_sandbox_requested:
         problems.append(
             "EXCHANGE_SANDBOX=true diabaikan: MEXC Futures tidak punya sandbox/testnet di ccxt, "

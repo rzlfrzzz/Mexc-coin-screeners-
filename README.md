@@ -93,13 +93,25 @@ cp .env.example .env
 ```
 
 Isi semua variabel di `.env`:
-- `EXCHANGE_API_KEY`, `EXCHANGE_API_SECRET` — API key MEXC futures (opsional untuk data publik,
-  tapi disarankan diisi untuk rate limit lebih tinggi). Exchange sendiri (MEXC) sudah hardcoded,
+- Tidak ada `EXCHANGE_API_KEY` / `EXCHANGE_API_SECRET` lagi. Bot ini hanya memanggil endpoint
+  publik MEXC (OHLCV, ticker, order book) dan tidak pernah menyentuh akun/eksekusi order, jadi
+  API key/secret exchange tidak dibutuhkan sama sekali. Exchange sendiri (MEXC) sudah hardcoded,
   tidak ada `EXCHANGE_ID` lagi di `.env`.
 - `WATCHLIST_SYMBOLS` — daftar pair yang mau discan, pisahkan koma. **Wajib format perpetual ccxt**
   `BASE/QUOTE:QUOTE`, contoh `BTC/USDT:USDT`, `ETH/USDT:USDT` (bukan `BTC/USDT` saja — itu format
   spot dan akan salah pasar). Kalau kamu telanjur menulis format spot, bot akan otomatis
-  menormalisasinya ke format futures lewat `ExchangeClient.normalize_symbol()`.
+  menormalisasinya ke format futures lewat `ExchangeClient.normalize_symbol()`. Dipakai penuh
+  kalau `WATCHLIST_MODE=static`, atau jadi watchlist awal/fallback kalau `WATCHLIST_MODE=dynamic`.
+- `WATCHLIST_MODE` — `static` (default, pakai `WATCHLIST_SYMBOLS` apa adanya) atau `dynamic`
+  (otomatis pakai top-N symbol MEXC Futures berdasarkan volume transaksi 24 jam, refresh berkala).
+  Dengan `dynamic`, watchlist tidak perlu diisi manual dan otomatis mengikuti coin yang lagi
+  ramai ditransaksikan.
+- `WATCHLIST_TOP_N` — jumlah symbol top-volume yang diambil kalau mode `dynamic` (default `20`).
+- `WATCHLIST_REFRESH_HOURS` — seberapa sering watchlist dinamis di-refresh, dalam jam (default
+  `12`). Refresh terjadi otomatis di awal setiap scan kalau sudah lewat interval ini — bukan job
+  terpisah, jadi tidak nambah proses baru. Refresh pertama selalu terjadi saat bot start.
+- `WATCHLIST_QUOTE` — quote currency untuk filter pair saat mode dynamic (default `USDT`, sesuai
+  MEXC Futures USDT-M).
 - `SUPABASE_URL`, `SUPABASE_KEY` — dari langkah 2
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` — dari langkah 3
 - Threshold lain (volume minimum, RSI, dsb) bisa disesuaikan sesuai kebutuhan

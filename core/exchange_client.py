@@ -19,9 +19,10 @@ class ExchangeClient:
     def __init__(self):
         # Hardcoded ke MEXC futures (USDT-M perpetual). defaultType="swap" memastikan
         # ccxt query ke market futures, bukan spot, walau symbol tanpa suffix ":USDT".
+        # Bot ini HANYA memanggil endpoint publik (OHLCV, ticker, order book), jadi
+        # sengaja TIDAK mengirim apiKey/secret sama sekali - tidak dibutuhkan dan
+        # menghindari kesalahpahaman bahwa bot ini butuh akses ke akun exchange.
         self.exchange = ccxt.mexc({
-            "apiKey": settings.exchange_api_key or None,
-            "secret": settings.exchange_api_secret or None,
             "enableRateLimit": True,
             "options": {"defaultType": settings.exchange_market_type},
         })
@@ -72,6 +73,36 @@ class ExchangeClient:
         if mid == 0:
             return float("inf")
         return (best_ask - best_bid) / mid * 100
+
+    def fetch_top_volume_symbols(self, top_n: int = 20, quote: str = "USDT") -> list:
+        """
+        Ambil top-N symbol MEXC Futures (USDT-M perpetual) berdasarkan volume transaksi
+        24 jam terakhir (quoteVolume), pakai endpoint publik fetch_tickers() - tidak butuh
+        API key/secret. Dipakai untuk watchlist dinamis (lihat core/watchlist.py).
+        """
+        self.load_markets()
+        tickers = self.exchange.fetch_tickers()
+
+        candidates = []
+        for symbol, market in self.exchange.markets.items():
+            # hanya USDT-M perpetual swap, quote currency sesuai parameter
+            if not market.get("swap") or market.get("quote") != quote:
+                continue
+            ticker = tickers.get(symbol)
+            if not ticker:
+                continue
+            vol = ticker.get("quoteVolume")
+            if vol is None:
+                # fallback: hitung dari baseVolume * last price kalau quoteVolume kosong
+                base_vol = ticker.get("baseVolume")
+                last = ticker.get("last")
+                vol = base_vol * last if base_vol and last else None
+            if vol is None:
+                continue
+            candidates.append((symbol, vol))
+
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return [sym for sym, _ in candidates[:top_n]]
 
     def safe_fetch_all(self, symbol: str) -> dict:
         """

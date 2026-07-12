@@ -51,4 +51,3 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 def atr_pct(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """ATR dinyatakan sebagai persentase dari harga close, memudahkan perbandingan antar coin."""
     return atr(df, period) / df["close"] * 100
-  

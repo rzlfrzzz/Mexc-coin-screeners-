@@ -43,11 +43,12 @@ def format_signal_message(signal: TradeSignal) -> str:
     if signal.risk_plan:
         rp = signal.risk_plan
         lines += [
-            f"Entry : {rp.entry:g}",
-            f"SL    : {rp.sl:g}",
-            f"TP1   : {rp.tp1:g} (RR 1:{rp.rr1:g})",
-            f"TP2   : {rp.tp2:g} (RR 1:{rp.rr2:g})",
-            f"TP3   : {rp.tp3:g} (RR 1:{rp.rr3:g})",
+            f"Entry      : {rp.entry:g}",
+            f"Stoplos    : {rp.sl:g}",
+            "",
+            f"TP1   : {rp.tp1:g}",
+            f"TP2   : {rp.tp2:g}",
+            f"TP3   : {rp.tp3:g}",
             "",
             "Risk/Reward: 1:3",
         ]

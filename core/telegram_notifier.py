@@ -19,13 +19,20 @@ def _check_mark(passed: bool) -> str:
     return "✅" if passed else "❌"
 
 
+def _base_symbol(symbol: str) -> str:
+    """Ambil kode base currency dari symbol ccxt, mis. 'ETH/USDT:USDT' -> 'ETH'."""
+    return symbol.split("/")[0].strip().upper()
+
+
 def format_signal_message(signal: TradeSignal) -> str:
     direction_emoji = "🟢" if signal.direction == Direction.LONG else "🔴"
     stars = STAR_MAP.get(signal.score.stars, "") if signal.score else ""
     snap = signal.indicators_snapshot
 
     lines = [
-        f"{direction_emoji} {signal.direction.value} {signal.symbol}",
+        f"{direction_emoji} {signal.direction.value}",
+        "",
+        f"Pair: ${_base_symbol(signal.symbol)}",
         "",
         f"Score: {signal.score.total}/100 {stars}",
         "",
@@ -43,8 +50,8 @@ def format_signal_message(signal: TradeSignal) -> str:
     if signal.risk_plan:
         rp = signal.risk_plan
         lines += [
-            f"Entry      : {rp.entry:g}",
-            f"Stoplos    : {rp.sl:g}",
+            f"Entry : {rp.entry:g}",
+            f"Stoploss  : {rp.sl:g}",
             "",
             f"TP1   : {rp.tp1:g}",
             f"TP2   : {rp.tp2:g}",
@@ -54,7 +61,7 @@ def format_signal_message(signal: TradeSignal) -> str:
         ]
 
     if signal.score and signal.score.grade == "B":
-        lines.append("\n⚠️ Note: B-setup, quality masih di bawah A. Gunakan size lebih kecil.")
+        lines += ["", "⚠️ Note: B-setup, quality masih di bawah A. Gunakan size lebih kecil."]
 
     return "\n".join(lines)
 

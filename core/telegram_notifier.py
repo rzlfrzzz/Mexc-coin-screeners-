@@ -24,18 +24,33 @@ def _base_symbol(symbol: str) -> str:
     return symbol.split("/")[0].strip().upper()
 
 
+DIVIDER = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
+
+DISCLAIMER = (
+    "🤖 <i>Signal ini dibuat otomatis oleh bot berdasarkan analisis teknikal. "
+    "Bukan merupakan nasihat keuangan. Selalu lakukan analisis &amp; riset mandiri "
+    "(DYOR) serta kelola risiko sebelum mengambil keputusan trading.</i>"
+)
+
+
 def format_signal_message(signal: TradeSignal) -> str:
     direction_emoji = "🟢" if signal.direction == Direction.LONG else "🔴"
     stars = STAR_MAP.get(signal.score.stars, "") if signal.score else ""
     snap = signal.indicators_snapshot
 
+    # NOTE: baris "Pair:", "Entry :", "Stoploss  :", "TP1/2/3   :", dan
+    # "Risk/Reward:" SENGAJA dibiarkan sebagai teks polos (tanpa tag HTML)
+    # karena field-field ini dibaca/di-parse oleh bot lain. Hanya elemen
+    # dekoratif (divider, judul section, disclaimer) yang dipercantik.
     lines = [
-        f"{direction_emoji} {signal.direction.value}",
+        DIVIDER,
+        f"{direction_emoji} <b>{signal.direction.value} SIGNAL</b>",
+        DIVIDER,
         "",
         f"Pair: ${_base_symbol(signal.symbol)}",
-        "",
         f"Score: {signal.score.total}/100 {stars}",
         "",
+        "📊 <b>Analisa Teknikal</b>",
         f"{_check_mark(snap.get('trend_htf_aligned'))} Trend {settings.tf_htf.upper():<8}: {snap.get('trend_label', '-')}",
         f"{_check_mark(snap.get('bos'))} BOS           : {snap.get('bos_label', '-')}",
         f"{_check_mark(snap.get('order_block_valid'))} Order Block   : {'Valid' if snap.get('order_block_valid') else 'Tidak ada'}",
@@ -50,6 +65,7 @@ def format_signal_message(signal: TradeSignal) -> str:
     if signal.risk_plan:
         rp = signal.risk_plan
         lines += [
+            "💰 <b>Trade Setup</b>",
             f"Entry : {rp.entry:g}",
             f"Stoploss  : {rp.sl:g}",
             "",
@@ -58,10 +74,14 @@ def format_signal_message(signal: TradeSignal) -> str:
             f"TP3   : {rp.tp3:g}",
             "",
             "Risk/Reward: 1:3",
+            "",
+            DIVIDER,
         ]
 
     if signal.score and signal.score.grade == "B":
         lines += ["", "⚠️ Note: B-setup, quality masih di bawah A. Gunakan size lebih kecil."]
+
+    lines += ["", DISCLAIMER]
 
     return "\n".join(lines)
 

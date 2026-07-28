@@ -19,7 +19,8 @@ create table if not exists signals (
     smart_money_zones jsonb,                     -- order block / FVG / liquidity sweep zones (Layer 4)
     indicators_snapshot jsonb,
     sent           boolean default false,
-    fail_layer     text,                         -- diisi jika signal gagal / tidak dikirim
+    fail_layer     text,                         -- diisi jika signal gagal / tidak dikirim (hard-stop)
+    soft_fail_layers jsonb,                      -- layer 4-6 yang FAIL tapi tidak menghentikan pipeline
     -- kolom untuk backtesting / outcome tracking
     outcome        text,                         -- WIN_TP1 | WIN_TP2 | WIN_TP3 | LOSS | BREAKEVEN | OPEN
     pnl_pct        numeric,

@@ -82,7 +82,8 @@ class TradeSignal:
     score: Optional[SignalScore] = None
     indicators_snapshot: dict = field(default_factory=dict)
     sent: bool = False
-    fail_layer: Optional[str] = None  # diisi jika pipeline berhenti di tengah jalan
+    fail_layer: Optional[str] = None  # diisi jika pipeline berhenti (hard-stop) di tengah jalan
+    soft_fail_layers: list = field(default_factory=list)  # layer 4-6 yang FAIL tapi tidak hard-stop
 
     def to_supabase_row(self) -> dict:
         return {
@@ -103,6 +104,7 @@ class TradeSignal:
             "indicators_snapshot": self.indicators_snapshot,
             "sent": self.sent,
             "fail_layer": self.fail_layer,
+            "soft_fail_layers": self.soft_fail_layers,
             # outcome & backtest fields diisi belakangan oleh proses tracking terpisah
             "outcome": None,
             "closed_at": None,

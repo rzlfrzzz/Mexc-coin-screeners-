@@ -1,9 +1,22 @@
 """
 pipeline.py
 ------------
-Orkestrasi 9 layer filter secara berurutan untuk satu symbol.
-Setiap layer independen (modul terpisah di /layers) dan bisa di-debug sendiri-sendiri.
-Begitu satu layer gagal, proses berhenti (fail-fast) dan failure point dicatat.
+Orkestrasi layer filter secara berurutan untuk satu symbol.
+
+Perubahan desain filter logic (lihat catatan masing-masing bagian di bawah):
+1. Layer 4 (Smart Money Area), 5 (Momentum), 6 (Volume) TIDAK LAGI hard-stop pipeline
+   kalau FAIL. Hasilnya tetap direkam & tetap masuk ke breakdown skor Layer 9 (soft/scoring),
+   supaya sinyal dengan kombinasi kekuatan lain yang bagus tidak otomatis gugur hanya karena
+   satu dari tiga layer "pendukung" ini gagal. Layer 1 (Market Health), 2 (Trend), Layer 0
+   (BTC Regime - baru), 3 (Structure alignment), 7 (Entry Trigger), 8 (Risk Management) tetap
+   hard gate karena masing-masing adalah prasyarat struktural (tanpa itu sinyal tidak valid
+   atau tidak punya arah/SL sama sekali).
+2. Layer 0 (baru) - BTC Market Regime: dievaluasi tepat setelah Layer 2 (begitu direction
+   symbol ditentukan), supaya bisa dibandingkan dengan regime BTC.
+3. Adaptive fractal lookback (dihitung di Layer 3, disimpan ke raw_data["swing_lookback"])
+   otomatis dipakai ulang oleh Layer 4 & Layer 8 lewat raw_data - tidak perlu perubahan lain
+   di sini, hanya urutan panggilan Layer 3 sebelum Layer 4/8 tetap dipertahankan.
+4. Funding rate check ada di dalam Layer 1 (lihat layers/layer1_market_health.py).
 """
 
 from loguru import logger
@@ -16,6 +29,7 @@ from core.supabase_client import supabase_store
 from core.telegram_notifier import send_signal
 
 from layers import (
+    layer0_btc_regime,
     layer1_market_health,
     layer2_trend,
     layer3_structure,
@@ -30,13 +44,14 @@ from layers import (
 
 def run_pipeline_for_symbol(symbol: str) -> TradeSignal | None:
     """
-    Jalankan seluruh 9 layer untuk satu symbol.
-    Return TradeSignal jika lolos scoring minimum, None jika gagal di layer manapun
-    atau skor di bawah threshold. Semua layer result tetap disimpan untuk debugging,
-    baik lolos maupun gagal.
+    Jalankan seluruh layer untuk satu symbol.
+    Return TradeSignal jika lolos scoring minimum, None jika gagal di salah satu hard-gate
+    layer atau skor di bawah threshold. Semua layer result tetap disimpan untuk debugging,
+    baik lolos, gagal-hard-stop, maupun gagal-soft (layer 4-6).
     """
     layer_results = []
     layer_by_number = {}
+    soft_fail_layers = []
 
     raw_data = exchange_client.safe_fetch_all(symbol)
     if not raw_data:
@@ -53,17 +68,25 @@ def run_pipeline_for_symbol(symbol: str) -> TradeSignal | None:
     def _fail_stop(lr):
         _record(lr)
         signal.fail_layer = f"Layer {lr.layer_number} - {lr.layer_name}"
+        signal.soft_fail_layers = soft_fail_layers
         logger.info(f"[{symbol}] STOP di Layer {lr.layer_number} ({lr.layer_name}): {lr.reason}")
         supabase_store.save_layer_log(symbol, layer_results)
         return None
 
-    # ---------------- Layer 1 ----------------
+    def _record_soft(lr):
+        """Untuk Layer 4/5/6: rekam hasil apa pun statusnya, TIDAK menghentikan pipeline."""
+        _record(lr)
+        if lr.status != LayerStatus.PASS:
+            soft_fail_layers.append(f"Layer {lr.layer_number} - {lr.layer_name}")
+            logger.info(f"[{symbol}] Layer {lr.layer_number} ({lr.layer_name}) FAIL (soft, lanjut): {lr.reason}")
+
+    # ---------------- Layer 1 (hard gate) ----------------
     lr1 = layer1_market_health.run(raw_data)
     if lr1.status != LayerStatus.PASS:
         return _fail_stop(lr1)
     _record(lr1)
 
-    # ---------------- Layer 2 ----------------
+    # ---------------- Layer 2 (hard gate) ----------------
     lr2 = layer2_trend.run(raw_data)
     if lr2.status != LayerStatus.PASS:
         return _fail_stop(lr2)
@@ -71,7 +94,15 @@ def run_pipeline_for_symbol(symbol: str) -> TradeSignal | None:
     direction = Direction(lr2.data["trend_direction"])
     signal.direction = direction
 
-    # ---------------- Layer 3 ----------------
+    # ---------------- Layer 0 (hard gate, toggleable) - BTC Market Regime ----------------
+    # Dijalankan di sini (bukan sebelum Layer 1) karena butuh `direction` dari Layer 2 untuk
+    # dibandingkan dengan regime BTC.
+    lr0 = layer0_btc_regime.run(raw_data, direction, exchange_client)
+    if lr0.status == LayerStatus.FAIL:
+        return _fail_stop(lr0)
+    _record(lr0)
+
+    # ---------------- Layer 3 (hard gate) ----------------
     lr3 = layer3_structure.run(raw_data)
     # konsistensi: structure harus searah trend besar
     structure_aligned = (
@@ -86,32 +117,29 @@ def run_pipeline_for_symbol(symbol: str) -> TradeSignal | None:
         return _fail_stop(lr3)
     _record(lr3)
 
-    # ---------------- Layer 4 ----------------
+    # ---------------- Layer 4 (SOFT - scoring, tidak hard-stop) ----------------
     lr4, smc_zones = layer4_smart_money.run(raw_data, direction)
-    if lr4.status != LayerStatus.PASS:
-        return _fail_stop(lr4)
-    _record(lr4)
+    _record_soft(lr4)
     signal.smart_money_zones = smc_zones
 
-    # ---------------- Layer 5 ----------------
+    # ---------------- Layer 5 (SOFT - scoring, tidak hard-stop) ----------------
     lr5 = layer5_momentum.run(raw_data, direction)
-    if lr5.status != LayerStatus.PASS:
-        return _fail_stop(lr5)
-    _record(lr5)
+    _record_soft(lr5)
 
-    # ---------------- Layer 6 ----------------
+    # ---------------- Layer 6 (SOFT - scoring, tidak hard-stop) ----------------
     lr6 = layer6_volume.run(raw_data)
-    if lr6.status != LayerStatus.PASS:
-        return _fail_stop(lr6)
-    _record(lr6)
+    _record_soft(lr6)
 
-    # ---------------- Layer 7 ----------------
+    # ---------------- Layer 7 (hard gate) ----------------
+    # prior_layers_passed di sini merujuk ke prasyarat HARD (1, 2, 0, 3) yang memang sudah
+    # pasti PASS di titik ini kalau kode sampai sejauh ini - Layer 4/5/6 boleh FAIL (soft)
+    # tanpa memblokir evaluasi entry trigger.
     lr7 = layer7_entry_trigger.run(raw_data, direction, prior_layers_passed=True)
     if lr7.status != LayerStatus.PASS:
         return _fail_stop(lr7)
     _record(lr7)
 
-    # ---------------- Layer 8 ----------------
+    # ---------------- Layer 8 (hard gate) ----------------
     lr8, risk_plan = layer8_risk_management.run(raw_data, direction)
     if lr8.status != LayerStatus.PASS or risk_plan is None:
         return _fail_stop(lr8)
@@ -137,6 +165,23 @@ def run_pipeline_for_symbol(symbol: str) -> TradeSignal | None:
     trend_label = "Bullish" if direction == Direction.LONG else "Bearish"
     bos_label = "Bullish" if lr3.data.get("bos_bullish") else ("Bearish" if lr3.data.get("bos_bearish") else "-")
 
+    # BTC regime aligned = benar-benar dikonfirmasi searah (bukan sekadar tidak diblokir).
+    # Kalau regime BTC netral/sideways atau filter dimatikan, ini dianggap False (tidak dapat
+    # bonus skor) walau tidak memblokir sinyal - konsisten dengan filosofi Layer 0 sebagai
+    # pengurang risiko, bukan syarat kelulusan tambahan.
+    btc_regime_aligned = bool(
+        lr0.status == LayerStatus.PASS
+        and lr0.data.get("btc_direction") == direction.value
+        and lr0.data.get("btc_direction") != Direction.NONE.value
+    )
+
+    # OI confirmation: kenaikan Open Interest signifikan dianggap indikasi posisi baru
+    # benar-benar dibangun (bukan cuma short-covering/long-unwind) -> breakout lebih valid.
+    oi_change_pct = raw_data.get("oi_change_pct")
+    oi_confirmation = bool(
+        oi_change_pct is not None and oi_change_pct > settings.oi_confirmation_min_change_pct
+    )
+
     snapshot = {
         "trend_htf_aligned": True,
         "trend_label": trend_label,
@@ -150,10 +195,17 @@ def run_pipeline_for_symbol(symbol: str) -> TradeSignal | None:
         "rsi_ok": bool(lr5.data.get("rsi_ok")),
         "atr_high": atr_high,
         "not_near_resistance": not_near_resistance,
+        "btc_regime_aligned": btc_regime_aligned,
+        "btc_direction": lr0.data.get("btc_direction"),
+        "oi_confirmation": oi_confirmation,
+        "oi_change_pct": oi_change_pct,
+        "funding_rate_pct": lr1.data.get("funding_rate_pct"),
+        "swing_lookback": lr3.data.get("swing_lookback"),
     }
     signal.indicators_snapshot = snapshot
+    signal.soft_fail_layers = soft_fail_layers
 
-    # ---------------- Layer 9 ----------------
+    # ---------------- Layer 9 (scoring final) ----------------
     score = layer9_scoring.run(layer_by_number, snapshot)
     signal.score = score
 
@@ -167,7 +219,8 @@ def run_pipeline_for_symbol(symbol: str) -> TradeSignal | None:
 
     if score.total < settings.score_min_to_send:
         signal.fail_layer = "Layer 9 - Scoring System"
-        logger.info(f"[{symbol}] Score {score.total} < {settings.score_min_to_send}, tidak dikirim")
+        logger.info(f"[{symbol}] Score {score.total} < {settings.score_min_to_send}, tidak dikirim "
+                    f"(soft-fail layers: {soft_fail_layers or 'tidak ada'})")
         supabase_store.save_signal(signal.to_supabase_row())
         return None
 

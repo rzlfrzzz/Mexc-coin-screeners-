@@ -15,20 +15,54 @@ yang tidak didukung di Python 3.9 ke bawah).
 
 ## Struktur Layer
 
-| # | Layer | Fungsi |
-|---|-------|--------|
-| 1 | Market Health | Volume, spread, ATR, cek pump/dump ekstrem |
-| 2 | Trend Besar (4H) | EMA200 4H -> tentukan mode LONG/SHORT only |
-| 3 | Market Structure (1H) | Swing HH/HL/LH/LL, BOS, CHoCH |
-| 4 | Smart Money Area | Order Block, Fair Value Gap, Liquidity Sweep |
-| 5 | Konfirmasi Momentum | RSI(14), MACD histogram |
-| 6 | Volume | Volume 1H vs SMA20 Volume |
-| 7 | Entry Trigger | Pattern konfirmasi (engulfing / breakout close) |
-| 8 | Risk Management | Hitung Entry/SL/TP1/TP2/TP3 otomatis |
-| 9 | Scoring System | Skor 0-100, klasifikasi A+/A/B, kirim jika >=70 |
+| # | Layer | Fungsi | Tipe Gate |
+|---|-------|--------|-----------|
+| 0 | BTC Market Regime | Trend 4H BTC (EMA200) harus align dengan direction altcoin | **Hard** (toggleable) |
+| 1 | Market Health | Volume, spread, ATR, pump/dump ekstrem, funding rate ekstrem | **Hard** |
+| 2 | Trend Besar (4H) | EMA200 4H -> tentukan mode LONG/SHORT only | **Hard** |
+| 3 | Market Structure (1H) | Swing HH/HL/LH/LL, BOS, CHoCH (adaptive fractal lookback) | **Hard** |
+| 4 | Smart Money Area | Order Block, Fair Value Gap, Liquidity Sweep | **Soft** (scoring) |
+| 5 | Konfirmasi Momentum | RSI(14), MACD histogram | **Soft** (scoring) |
+| 6 | Volume | Volume 1H vs SMA20 Volume | **Soft** (scoring) |
+| 7 | Entry Trigger | Pattern konfirmasi (engulfing / breakout close) | **Hard** |
+| 8 | Risk Management | Hitung Entry/SL/TP1/TP2/TP3 otomatis | **Hard** |
+| 9 | Scoring System | Skor 0-100 (termasuk BTC regime & OI confirmation), kirim jika >=70 | **Hard** (threshold) |
 
-Jika satu layer gagal, pipeline **berhenti** (fail-fast) dan failure point dicatat ke tabel
-`layer_logs` di Supabase — memudahkan proses tracing & refinement.
+**Desain fail-fast vs soft-scoring:** Layer 0/1/2/3/7/8 adalah prasyarat struktural (tanpa
+salah satunya, sinyal tidak valid sama sekali atau tidak punya arah/SL) sehingga tetap
+hard-stop kalau gagal — failure point dicatat ke tabel `layer_logs` di Supabase. Layer 4/5/6
+sebelumnya juga hard-stop, tapi sekarang bersifat **soft**: kalau gagal, hasilnya tetap
+direkam dan tetap mempengaruhi skor Layer 9 (poin dikurangi, bukan otomatis gugur), supaya
+sinyal dengan kombinasi kekuatan lain yang bagus tidak gagal total hanya karena satu dari
+tiga layer "pendukung" ini tidak lolos. Layer mana saja yang soft-fail untuk suatu sinyal
+tercatat di field `soft_fail_layers`.
+
+### Layer 0 — BTC Market Regime (baru)
+
+Altcoin sangat berkorelasi dengan BTC. Sebelum sinyal altcoin dievaluasi, bot mengecek trend
+4H BTC (logika EMA200 yang sama dengan Layer 2). Kalau regime BTC jelas berlawanan arah
+dengan direction altcoin, sinyal di-skip. Kalau regime BTC netral/sideways, filter ini tidak
+memblokir. Regime BTC di-cache & refresh berkala (`BTC_REGIME_REFRESH_MINUTES`), bukan fetch
+ulang tiap symbol, supaya hemat API call. Bisa dimatikan lewat `ENABLE_BTC_REGIME_FILTER=false`.
+
+### Funding Rate (Layer 1) & Open Interest Confirmation (scoring, baru)
+
+Funding rate ekstrem (`MAX_FUNDING_RATE_ABS_PCT`) dianggap tanda crowded trade satu sisi dan
+memblokir sinyal di Layer 1 (kalau data funding tersedia dari MEXC — kalau tidak, cek ini
+di-skip secara graceful, tidak memblokir). Open Interest confirmation bersifat soft/scoring
+saja (`OI_CONFIRMATION_MIN_CHANGE_PCT`) karena data historis OI via ccxt/MEXC tidak selalu
+stabil — kenaikan OI signifikan menambah skor karena mengindikasikan posisi baru benar-benar
+dibangun, bukan hanya short-covering/long-unwind.
+
+### Adaptive Swing/Fractal Lookback (Layer 3, baru)
+
+Sebelumnya lookback fractal untuk deteksi swing high/low konstan (N=3) untuk semua pair.
+Sekarang dihitung otomatis dari rata-rata ATR% 1H coin itu sendiri: coin ber-volatilitas
+rendah pakai lookback lebih kecil (lebih sensitif), coin ber-volatilitas tinggi pakai
+lookback lebih besar (mengurangi swing palsu akibat noise). Nilai dihitung sekali di Layer 3
+lalu dipakai ulang oleh Layer 4 dan Layer 8 untuk konsistensi definisi swing per symbol.
+Rentang & threshold bisa diatur lewat `SWING_LOOKBACK_MIN/MAX/DEFAULT` dan
+`SWING_LOOKBACK_LOW_ATR_PCT/HIGH_ATR_PCT`.
 
 ## Struktur Folder
 
@@ -167,11 +201,62 @@ untuk melihat persis di layer mana suatu setup gagal, dan kenapa.
 
 ## Backtesting / Outcome Tracking
 
-Tabel `signals` punya kolom `outcome`, `pnl_pct`, `closed_at` yang sengaja dikosongkan saat
-insert. Buat proses terpisah (cron job / script tambahan) yang secara berkala mengecek harga
-market terhadap `entry/sl/tp1/tp2/tp3` tiap signal yang `outcome` nya masih `NULL`, lalu panggil
-`supabase_client.update_signal_outcome()` untuk mencatat hasilnya. Ini dipisah dari pipeline utama
-supaya scanning real-time tidak terbebani proses tracking historis.
+### Outcome tracking (otomatis)
+
+Tabel `signals` punya kolom `outcome`, `pnl_pct`, `closed_at`. Sekarang kolom ini diisi
+**otomatis** oleh `outcome_tracker.py`, yang berjalan di scheduler terpisah dari
+`scan_watchlist()` (lihat `main.py`, interval diatur lewat `OUTCOME_TRACKING_INTERVAL_SECONDS`,
+default tiap 1 jam — tidak perlu secepat scan sinyal baru). Untuk tiap sinyal yang sudah
+terkirim tapi `outcome` masih `NULL`, tracker mengambil candle 15m sejak `generated_at` dan
+menentukan apakah SL tersentuh duluan (`LOSS_SL`) atau TP1/2/3 tersentuh (`WIN_TP1/2/3`);
+kalau belum ada yang tersentuh setelah `OUTCOME_MAX_AGE_HOURS` (default 72 jam), ditandai
+`OPEN_EXPIRED` supaya tidak menggantung selamanya.
+
+Jalankan manual sekali:
+```bash
+python outcome_tracker.py
+```
+Setelah beberapa waktu berjalan, win-rate riil bisa dihitung langsung dari Supabase:
+```sql
+select outcome, count(*), avg(pnl_pct)
+from signals
+where outcome is not null
+group by outcome;
+```
+
+### Backtest historis (`backtest.py`)
+
+Sebelumnya semua threshold default (RSI, volume spike multiplier, score minimum, dst)
+adalah angka "masuk akal secara intuisi TA umum" yang **belum pernah divalidasi** terhadap
+data MEXC riil. `backtest.py` menjalankan ulang modul layer yang **persis sama** dengan
+`pipeline.py` (bukan reimplementasi terpisah) secara bar-by-bar di atas data historis
+(tanpa lookahead bias — tiap bar hanya melihat data sampai saat itu), lalu mensimulasikan
+outcome tiap sinyal (SL/TP mana yang tersentuh duluan) untuk menghasilkan win-rate &
+expectancy riil.
+
+```bash
+# Backtest satu/lebih symbol, 60 hari terakhir
+python backtest.py --symbols BTC/USDT:USDT,ETH/USDT:USDT --days 60
+
+# Grid search parameter (contoh bawaan: score_min_to_send x volume_spike_multiplier)
+python backtest.py --symbols BTC/USDT:USDT --days 60 --grid-search
+```
+
+**Keterbatasan yang perlu diketahui:**
+- funding rate & OI historis tidak disimulasikan (data granular historisnya tidak selalu
+  tersedia gratis) — filter funding di Layer 1 otomatis di-skip (graceful, sama seperti
+  perilaku live saat data funding tidak tersedia), dan OI confirmation di scoring otomatis
+  0 poin. Skor hasil backtest karena itu sedikit lebih rendah dari estimasi skor live yang
+  funding/OI-nya tersedia — ini disengaja, bukan bug.
+- Spread historis diasumsikan konstan (tidak ada data order-book historis gratis).
+- Environment tempat kode ini disusun tidak punya akses jaringan ke `api.mexc.com`, jadi
+  backtest terhadap data MEXC riil **perlu dijalankan sendiri** di environment Anda —
+  skrip ini sudah diuji logikanya (deteksi sinyal, simulasi outcome, agregasi ringkasan)
+  dengan data OHLCV sintetis dan terbukti benar, tapi angka win-rate/threshold yang
+  realistis baru bisa didapat dari data MEXC riil.
+
+Ubah `param_grid` di `backtest.py` (fungsi `_cli()`) untuk menguji parameter lain, atau
+panggil `backtest.grid_search()` langsung dari skrip Python sendiri.
 
 ## Perubahan dari Versi Sebelumnya (Bug Fix + MEXC-only)
 
@@ -193,6 +278,21 @@ supaya scanning real-time tidak terbebani proses tracking historis.
 5. **Exchange dikunci ke MEXC Futures saja** — `EXCHANGE_ID` dihapus dari `.env`, di-hardcode di
    `config.py`, supaya tidak ada kemungkinan bot tidak sengaja jalan ke exchange lain yang
    threshold-nya belum ditala untuk MEXC.
+6. **Retry-with-backoff untuk API call** — semua panggilan ccxt (OHLCV, ticker, order book,
+   funding rate, open interest, load markets) sekarang dibungkus retry otomatis untuk error
+   transient (network blip, rate limit sesaat), lihat `ExchangeClient._call_with_retry()`.
+   Sebelumnya satu kegagalan sesaat langsung membuat symbol tsb di-skip untuk siklus scan itu.
+7. **Candle-closed check (anti repaint)** — `fetch_ohlcv_df()` sekarang membuang candle
+   terakhir yang masih "live"/belum closed (`DROP_UNCLOSED_CANDLE=true` default), supaya
+   sinyal (terutama Layer 7 entry trigger yang deteksi pattern candlestick) tidak berubah-ubah
+   antar-scan karena candle yang dievaluasi masih terus terbentuk.
+8. **Threshold ATR & volume relatif per-coin** — Layer 1 sekarang juga mengecek percentile
+   ATR%/volume coin terhadap histori coin itu sendiri (`ENABLE_RELATIVE_ATR_FILTER`,
+   `ENABLE_RELATIVE_VOLUME_FILTER`), bukan hanya angka absolut sama untuk semua symbol.
+9. **Outcome tracking & backtest otomatis** — `outcome_tracker.py` (menentukan WIN/LOSS
+   otomatis untuk sinyal yang sudah dikirim) dan `backtest.py` (validasi historis + grid
+   search parameter) ditambahkan — sebelumnya kolom `outcome`/`pnl_pct` permanen kosong dan
+   threshold default tidak pernah divalidasi.
 
 Jika kamu sudah pernah menjalankan tabel Supabase versi lama, jalankan migrasi berikut agar
 kolom baru tersedia:

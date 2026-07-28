@@ -16,6 +16,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from config import settings, validate_settings
 from pipeline import scan_watchlist
 from core.watchlist import watchlist_manager
+from outcome_tracker import track_outcomes
 
 
 def configure_logging():
@@ -32,6 +33,14 @@ def job():
     elapsed = time.time() - start
     symbols = watchlist_manager.current_symbols()
     logger.info(f"=== Scan selesai dalam {elapsed:.1f}s untuk {symbols}, {len(signals)} signal terkirim ===")
+
+
+def outcome_tracking_job():
+    logger.info("=== Mulai outcome tracking ===")
+    try:
+        track_outcomes()
+    except Exception as e:
+        logger.exception(f"Error saat outcome tracking: {e}")
 
 
 def main():
@@ -62,6 +71,14 @@ def main():
     scheduler = BlockingScheduler(timezone="UTC")
     scheduler.add_job(job, "interval", seconds=settings.scan_interval_seconds,
                        id="scan_watchlist", max_instances=1, coalesce=True)
+
+    if settings.enable_outcome_tracking:
+        scheduler.add_job(outcome_tracking_job, "interval", seconds=settings.outcome_tracking_interval_seconds,
+                           id="outcome_tracking", max_instances=1, coalesce=True)
+        logger.info(f"Outcome tracking aktif, interval {settings.outcome_tracking_interval_seconds}s.")
+    else:
+        logger.info("Outcome tracking dimatikan (ENABLE_OUTCOME_TRACKING=false).")
+
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):

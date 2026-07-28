@@ -51,3 +51,23 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 def atr_pct(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """ATR dinyatakan sebagai persentase dari harga close, memudahkan perbandingan antar coin."""
     return atr(df, period) / df["close"] * 100
+
+
+def percentile_of_last(series: pd.Series, lookback: int | None = None, min_history: int = 100):
+    """
+    Percentile rank (0-100) dari nilai TERAKHIR suatu series relatif terhadap histori series
+    itu SENDIRI (bukan dibandingkan ke coin lain). Dipakai untuk threshold adaptif per-coin,
+    misalnya "apakah ATR% sekarang termasuk rendah dibanding kondisi normal coin ini sendiri
+    selama N candle terakhir" - alih-alih memakai angka absolut yang sama untuk semua coin.
+
+    Return None kalau histori belum cukup (< min_history titik data valid) - dipakai supaya
+    pemanggil bisa graceful-skip cek relatif untuk symbol yang baru listing / data terbatas.
+    """
+    s = series.dropna()
+    if lookback:
+        s = s.tail(lookback)
+    if len(s) < min_history:
+        return None
+    last = s.iloc[-1]
+    rank = (s <= last).sum() / len(s) * 100
+    return float(rank)

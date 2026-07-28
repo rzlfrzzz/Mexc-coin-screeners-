@@ -66,6 +66,15 @@ def run(layer_results_by_number: dict, indicators_snapshot: dict) -> SignalScore
     breakdown["atr_high"] = w["atr_high"] if indicators_snapshot.get("atr_high") else 0
     breakdown["not_near_resistance"] = w["not_near_resistance"] if indicators_snapshot.get("not_near_resistance") else 0
 
+    # Layer 0 (BTC regime) - hard gate di pipeline sudah memblokir kasus berlawanan arah,
+    # jadi field ini biasanya True di titik ini kecuali BTC regime sedang netral/sideways
+    # (di mana filter tidak memblokir tapi juga tidak dianggap "confirmed align").
+    breakdown["btc_regime_aligned"] = w["btc_regime_aligned"] if indicators_snapshot.get("btc_regime_aligned") else 0
+
+    # Open Interest confirmation - soft/scoring only (data OI via ccxt/MEXC tidak selalu
+    # tersedia), jadi tidak pernah memblokir sinyal, hanya menambah/tidak menambah skor.
+    breakdown["oi_confirmation"] = w["oi_confirmation"] if indicators_snapshot.get("oi_confirmation") else 0
+
     total = sum(breakdown.values())
     total = min(total, 100)
 

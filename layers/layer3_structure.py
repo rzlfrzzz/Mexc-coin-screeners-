@@ -15,8 +15,44 @@ Definisi dipakai:
 
 from models import LayerResult, LayerStatus
 from config import settings
+from indicators.technical import atr_pct
 
-SWING_LOOKBACK = 3  # jumlah candle kiri/kanan untuk validasi fractal
+SWING_LOOKBACK = 3  # fallback/default kalau adaptive lookback tidak bisa dihitung
+
+
+def compute_adaptive_lookback(df, period: int = 14) -> int:
+    """
+    Tentukan jumlah candle kiri/kanan (lookback) untuk validasi fractal secara adaptif
+    berdasarkan volatilitas coin itu sendiri (rata-rata ATR% 1H selama `period` candle
+    terakhir), bukan konstanta tetap N=3 untuk semua pair:
+    - ATR% rendah (coin "tenang")  -> lookback lebih KECIL, supaya tetap sensitif
+      mendeteksi swing (kalau tetap pakai N besar, swing asli yang kecil bisa terlewat).
+    - ATR% tinggi (coin noisy/volatile) -> lookback lebih BESAR, supaya swing minor akibat
+      noise tidak salah dianggap sebagai swing high/low yang valid.
+    Dibatasi antara settings.swing_lookback_min dan settings.swing_lookback_max.
+    """
+    try:
+        atr_series = atr_pct(df, period=period)
+        recent_atr = atr_series.tail(50).dropna()
+        if recent_atr.empty:
+            return settings.swing_lookback_default
+        avg_atr_pct = float(recent_atr.mean())
+    except Exception:
+        return settings.swing_lookback_default
+
+    if avg_atr_pct <= settings.swing_lookback_low_atr_pct:
+        lookback = settings.swing_lookback_min
+    elif avg_atr_pct >= settings.swing_lookback_high_atr_pct:
+        lookback = settings.swing_lookback_max
+    else:
+        # interpolasi linear antara min dan max di rentang low_atr_pct..high_atr_pct
+        span = settings.swing_lookback_high_atr_pct - settings.swing_lookback_low_atr_pct
+        ratio = (avg_atr_pct - settings.swing_lookback_low_atr_pct) / span if span > 0 else 0.5
+        lookback = round(
+            settings.swing_lookback_min + ratio * (settings.swing_lookback_max - settings.swing_lookback_min)
+        )
+
+    return max(settings.swing_lookback_min, min(settings.swing_lookback_max, int(lookback)))
 
 
 def find_swings(df, lookback: int = SWING_LOOKBACK):
@@ -66,11 +102,19 @@ def label_swings(swings: list) -> list:
 
 def run(raw_data: dict) -> LayerResult:
     df_mtf = raw_data["ohlcv_mtf"]
-    swings = find_swings(df_mtf)
+
+    # Adaptive lookback dihitung sekali di sini lalu disimpan ke raw_data supaya Layer 4
+    # (order block / liquidity sweep) dan Layer 8 (swing ref untuk SL) memakai nilai yang
+    # persis sama - konsisten satu symbol, satu lookback, bukan tiap layer hitung sendiri.
+    swing_lookback = compute_adaptive_lookback(df_mtf)
+    raw_data["swing_lookback"] = swing_lookback
+
+    swings = find_swings(df_mtf, lookback=swing_lookback)
 
     if len(swings) < 4:
         return LayerResult(3, "Market Structure 1H", LayerStatus.FAIL,
-                            "Swing terlalu sedikit untuk analisis struktur", {"swings": swings})
+                            "Swing terlalu sedikit untuk analisis struktur",
+                            {"swings": swings, "swing_lookback": swing_lookback})
 
     labeled = label_swings(swings)
     recent_labels = [s["label"] for s in labeled if s["label"] is not None][-4:]
@@ -105,6 +149,7 @@ def run(raw_data: dict) -> LayerResult:
         "structure_bias": structure_bias,
         "last_high_swing": last_high_swing,
         "last_low_swing": last_low_swing,
+        "swing_lookback": swing_lookback,
     }
 
     if not bos_bullish and not bos_bearish and not choch:

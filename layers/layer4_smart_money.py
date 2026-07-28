@@ -74,12 +74,15 @@ def find_fvgs(df: pd.DataFrame, direction: Direction, lookback: int = 40):
     return zones
 
 
-def find_liquidity_sweep(df: pd.DataFrame, direction: Direction):
+def find_liquidity_sweep(df: pd.DataFrame, direction: Direction, lookback: int = None):
     """
     Cek apakah candle terakhir (atau 2 terakhir) menyapu swing low/high sebelumnya
     dengan wick, lalu close balik ke dalam range -> sweep valid.
+    `lookback` idealnya adalah swing_lookback adaptif yang sama yang dipakai Layer 3
+    (raw_data["swing_lookback"]) supaya definisi swing konsisten di seluruh pipeline
+    untuk satu symbol yang sama.
     """
-    swings = find_swings(df)
+    swings = find_swings(df) if lookback is None else find_swings(df, lookback=lookback)
     if not swings or len(df) < 5:
         return None
 
@@ -123,9 +126,11 @@ def run(raw_data: dict, direction: Direction) -> LayerResult:
     df_mtf = raw_data["ohlcv_mtf"]
     current_price = float(df_mtf["close"].iloc[-1])
 
+    swing_lookback = raw_data.get("swing_lookback")
+
     order_blocks = find_order_blocks(df_mtf, direction)
     fvgs = find_fvgs(df_mtf, direction)
-    sweep = find_liquidity_sweep(df_mtf, direction)
+    sweep = find_liquidity_sweep(df_mtf, direction, lookback=swing_lookback)
 
     ob_in_range = [ob for ob in order_blocks if price_in_zone(current_price, ob)]
     fvg_in_range = [f for f in fvgs if price_in_zone(current_price, f)]

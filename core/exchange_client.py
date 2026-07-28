@@ -8,11 +8,24 @@ dari MEXC Futures (USDT-M Perpetual). Bot ini sengaja dikunci hanya untuk MEXC:
 Semua layer memanggil fungsi di sini, bukan ccxt langsung, supaya mudah di-mock saat testing.
 """
 
+import time
+
 import ccxt
 import pandas as pd
 from loguru import logger
 
 from config import settings
+
+# Error transient yang layak di-retry (network blip, rate limit sesaat, exchange maintenance
+# singkat). Error di LUAR daftar ini (mis. BadSymbol, AuthenticationError, InvalidOrder)
+# dianggap definitif - retry tidak akan membantu, jadi langsung dilempar ulang tanpa delay.
+RETRYABLE_ERRORS = (
+    ccxt.NetworkError,
+    ccxt.RequestTimeout,
+    ccxt.ExchangeNotAvailable,
+    ccxt.DDoSProtection,
+    ccxt.RateLimitExceeded,
+)
 
 
 class ExchangeClient:
@@ -31,6 +44,31 @@ class ExchangeClient:
         # jadi sengaja TIDAK dipanggil sama sekali. Warning ke user sudah dilakukan
         # di config.validate_settings() kalau EXCHANGE_SANDBOX=true di .env.
         self._markets_loaded = False
+        # Cache OI terakhir per symbol {symbol: (timestamp, oi_usd)} supaya bisa hitung
+        # % perubahan OI antar-scan tanpa perlu endpoint historical OI (yang belum tentu
+        # didukung ccxt untuk MEXC).
+        self._oi_history: dict = {}
+
+    @staticmethod
+    def _call_with_retry(fn, *args, **kwargs):
+        """
+        Panggil fn(*args, **kwargs) dengan retry + exponential backoff untuk error transient
+        (lihat RETRYABLE_ERRORS). Error non-transient langsung dilempar ulang tanpa retry.
+        Percobaan & delay diatur lewat settings.api_max_retries / api_retry_base_delay_sec.
+        """
+        last_error = None
+        for attempt in range(settings.api_max_retries + 1):
+            try:
+                return fn(*args, **kwargs)
+            except RETRYABLE_ERRORS as e:
+                last_error = e
+                if attempt >= settings.api_max_retries:
+                    break
+                delay = settings.api_retry_base_delay_sec * (2 ** attempt)
+                logger.warning(f"Retryable error ({type(e).__name__}: {e}), "
+                                f"percobaan {attempt + 1}/{settings.api_max_retries}, retry dalam {delay:.1f}s")
+                time.sleep(delay)
+        raise last_error
 
     @staticmethod
     def normalize_symbol(symbol: str) -> str:
@@ -48,23 +86,63 @@ class ExchangeClient:
 
     def load_markets(self):
         if not self._markets_loaded:
-            self.exchange.load_markets()
+            self._call_with_retry(self.exchange.load_markets)
             self._markets_loaded = True
 
     def fetch_ohlcv_df(self, symbol: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
-        """Ambil candlestick data dan kembalikan sebagai DataFrame pandas."""
-        raw = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        """
+        Ambil candlestick data dan kembalikan sebagai DataFrame pandas.
+
+        Reliabilitas:
+        - Dibungkus retry-with-backoff untuk error transient (lihat _call_with_retry).
+        - Kalau settings.drop_unclosed_candle=True (default), candle TERAKHIR yang masih
+          "live"/belum closed dibuang. Tanpa ini, layer yang membaca candle terakhir
+          (terutama Layer 7 entry trigger yang mendeteksi pattern candlestick) bisa
+          menghasilkan sinyal yang "repaint" - berubah-ubah tiap scan karena candle
+          tersebut masih terus terbentuk. Untuk kompensasi, fetch limit+2 candle lalu
+          trim ke `limit` supaya jumlah candle CLOSED yang dikembalikan tetap konsisten.
+        """
+        fetch_limit = limit + 2 if settings.drop_unclosed_candle else limit
+        raw = self._call_with_retry(self.exchange.fetch_ohlcv, symbol, timeframe=timeframe, limit=fetch_limit)
         df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        df.set_index("timestamp", inplace=True)
+
+        if settings.drop_unclosed_candle and len(df) > 0:
+            try:
+                tf_seconds = self.exchange.parse_timeframe(timeframe)
+                last_candle_open_ms = int(df.index[-1].timestamp() * 1000)
+                last_candle_close_ms = last_candle_open_ms + tf_seconds * 1000
+                now_ms = int(time.time() * 1000)
+                if now_ms < last_candle_close_ms:
+                    df = df.iloc[:-1]
+            except Exception as e:
+                logger.warning(f"[{symbol}] Gagal cek status closed candle ({e}), candle terakhir tetap dipakai apa adanya")
+
+        return df.tail(limit)
+
+    def fetch_ohlcv_since_df(self, symbol: str, timeframe: str, since_ms: int, limit: int = 1000) -> pd.DataFrame:
+        """
+        Ambil candlestick sejak timestamp tertentu (ms epoch) sampai sekarang - dipakai oleh
+        outcome_tracker.py (mengecek pergerakan harga sejak signal digenerate) dan backtest.py
+        (mengambil data historis untuk simulasi). Sama seperti fetch_ohlcv_df tapi pakai
+        parameter `since` alih-alih hanya limit candle terakhir.
+        """
+        raw = self._call_with_retry(self.exchange.fetch_ohlcv, symbol, timeframe=timeframe,
+                                     since=since_ms, limit=limit)
+        df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        if df.empty:
+            return df
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         df.set_index("timestamp", inplace=True)
         return df
 
     def fetch_ticker(self, symbol: str) -> dict:
-        return self.exchange.fetch_ticker(symbol)
+        return self._call_with_retry(self.exchange.fetch_ticker, symbol)
 
     def fetch_order_book_spread_pct(self, symbol: str) -> float:
         """Spread bid-ask dalam persen relatif terhadap mid price."""
-        ob = self.exchange.fetch_order_book(symbol, limit=5)
+        ob = self._call_with_retry(self.exchange.fetch_order_book, symbol, limit=5)
         if not ob["bids"] or not ob["asks"]:
             return float("inf")
         best_bid = ob["bids"][0][0]
@@ -74,6 +152,53 @@ class ExchangeClient:
             return float("inf")
         return (best_ask - best_bid) / mid * 100
 
+    def fetch_funding_rate_pct(self, symbol: str):
+        """
+        Ambil funding rate saat ini (dalam persen, mis. 0.35 = 0.35% per interval funding)
+        via endpoint publik ccxt fetch_funding_rate(). Return None kalau tidak didukung/gagal
+        setelah retry (dipakai untuk graceful degradation - filter funding di Layer 1
+        di-skip, bukan crash, kalau data tidak tersedia).
+        """
+        try:
+            fr = self._call_with_retry(self.exchange.fetch_funding_rate, symbol)
+            rate = fr.get("fundingRate")
+            if rate is None:
+                return None
+            return float(rate) * 100
+        except Exception as e:
+            logger.warning(f"[{symbol}] Funding rate tidak tersedia ({e}), filter funding di-skip untuk symbol ini")
+            return None
+
+    def fetch_open_interest_change_pct(self, symbol: str):
+        """
+        Ambil Open Interest saat ini via endpoint publik ccxt fetch_open_interest(), lalu
+        bandingkan dengan nilai OI symbol ini yang tercatat pada scan sebelumnya untuk
+        menghasilkan % perubahan OI antar-scan (proxy sederhana untuk "apakah posisi baru
+        sedang dibangun", bukan OI history resmi karena ccxt/MEXC belum tentu menyediakan
+        endpoint historical OI). Return None kalau data tidak tersedia atau ini scan pertama
+        untuk symbol tsb (belum ada baseline pembanding).
+        """
+        try:
+            oi_data = self._call_with_retry(self.exchange.fetch_open_interest, symbol)
+            oi_value = oi_data.get("openInterestValue") or oi_data.get("openInterestAmount")
+            if oi_value is None:
+                return None
+            oi_value = float(oi_value)
+        except Exception as e:
+            logger.warning(f"[{symbol}] Open interest tidak tersedia ({e}), OI confirmation di-skip untuk symbol ini")
+            return None
+
+        now = time.time()
+        prev = self._oi_history.get(symbol)
+        self._oi_history[symbol] = (now, oi_value)
+
+        if prev is None or prev[1] == 0:
+            return None
+
+        prev_ts, prev_oi = prev
+        change_pct = (oi_value - prev_oi) / prev_oi * 100
+        return change_pct
+
     def fetch_top_volume_symbols(self, top_n: int = 20, quote: str = "USDT") -> list:
         """
         Ambil top-N symbol MEXC Futures (USDT-M perpetual) berdasarkan volume transaksi
@@ -81,7 +206,7 @@ class ExchangeClient:
         API key/secret. Dipakai untuk watchlist dinamis (lihat core/watchlist.py).
         """
         self.load_markets()
-        tickers = self.exchange.fetch_tickers()
+        tickers = self._call_with_retry(self.exchange.fetch_tickers)
 
         candidates = []
         for symbol, market in self.exchange.markets.items():
@@ -117,6 +242,10 @@ class ExchangeClient:
                 "spread_pct": self.fetch_order_book_spread_pct(symbol),
                 "ohlcv_htf": self.fetch_ohlcv_df(symbol, settings.tf_htf, limit=300),
                 "ohlcv_mtf": self.fetch_ohlcv_df(symbol, settings.tf_mtf, limit=300),
+                # None kalau tidak didukung/gagal - masing-masing layer wajib menangani None
+                # secara graceful (skip check), bukan menganggapnya sebagai kegagalan fetch total.
+                "funding_rate_pct": self.fetch_funding_rate_pct(symbol),
+                "oi_change_pct": self.fetch_open_interest_change_pct(symbol),
             }
             return data
         except Exception as e:

@@ -19,6 +19,12 @@ def _check_mark(passed: bool) -> str:
     return "✅" if passed else "❌"
 
 
+def _fmt_pct(val) -> str:
+    if val is None:
+        return "N/A"
+    return f"{val:+.1f}%"
+
+
 def _base_symbol(symbol: str) -> str:
     """Ambil kode base currency dari symbol ccxt, mis. 'ETH/USDT:USDT' -> 'ETH'."""
     return symbol.split("/")[0].strip().upper()
@@ -59,8 +65,13 @@ def format_signal_message(signal: TradeSignal) -> str:
         f"{_check_mark(snap.get('rsi_ok'))} RSI           : {snap.get('rsi', 0):.0f}",
         f"{_check_mark(snap.get('atr_high'))} ATR           : {'Tinggi' if snap.get('atr_high') else 'Rendah'}",
         f"{_check_mark(snap.get('not_near_resistance'))} Tidak dekat R : {'Aman' if snap.get('not_near_resistance') else 'Dekat resistance'}",
+        f"{_check_mark(snap.get('btc_regime_aligned'))} BTC Regime    : {snap.get('btc_direction', '-') or '-'}",
+        f"{_check_mark(snap.get('oi_confirmation'))} OI Confirm    : {_fmt_pct(snap.get('oi_change_pct'))}",
         "",
     ]
+
+    if signal.soft_fail_layers:
+        lines += [f"ℹ️ Catatan: {', '.join(signal.soft_fail_layers)} tidak lolos penuh (skor dikurangi, bukan diblokir)", ""]
 
     if signal.risk_plan:
         rp = signal.risk_plan

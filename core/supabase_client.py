@@ -100,5 +100,29 @@ class SupabaseStore:
         except Exception as e:
             logger.error(f"Gagal update outcome signal {signal_id}: {e}")
 
+    def fetch_open_signals(self, limit: int = 200) -> list:
+        """
+        Ambil signal yang sudah terkirim (sent=True) tapi belum punya outcome (outcome IS NULL)
+        - dipakai oleh outcome_tracker.py untuk menentukan apakah SL/TP sudah tersentuh sejak
+        signal digenerate, supaya win-rate riil bisa dihitung otomatis (bukan manual/kosong).
+        """
+        if not self.client:
+            logger.warning("Supabase tidak terkoneksi, tidak bisa ambil open signals.")
+            return []
+        try:
+            res = (
+                self.client.table(settings.supabase_signals_table)
+                .select("*")
+                .eq("sent", True)
+                .is_("outcome", "null")
+                .order("generated_at", desc=False)
+                .limit(limit)
+                .execute()
+            )
+            return res.data or []
+        except Exception as e:
+            logger.error(f"Gagal ambil open signals dari Supabase: {e}")
+            return []
+
 
 supabase_store = SupabaseStore()

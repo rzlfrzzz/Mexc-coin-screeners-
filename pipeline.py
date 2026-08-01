@@ -238,6 +238,23 @@ def process_and_dispatch(symbol: str) -> TradeSignal | None:
     if signal is None:
         return None
 
+    # ---------------- Anti-duplikasi: skip kalau symbol ini masih ada trade open ----------------
+    # Trade "open" = signal sebelumnya sudah terkirim (sent=True) tapi outcome-nya belum
+    # ditentukan oleh outcome_tracker.py (belum kena SL/TP/expired). Tanpa cek ini, symbol
+    # yang sama bisa lolos pipeline lagi & lagi di setiap scan interval selagi indikatornya
+    # belum berubah, sehingga terkirim berkali-kali (duplikasi) untuk trade yang sebenarnya
+    # masih berjalan.
+    if supabase_store.has_open_signal(symbol):
+        logger.info(
+            f"[{symbol}] Skip kirim: masih ada trade open (belum SL/TP/expired) untuk symbol ini."
+        )
+        signal.sent = False
+        skip_row = signal.to_supabase_row()
+        skip_row["outcome"] = "SKIPPED_DUPLICATE"
+        skip_row["closed_at"] = signal.generated_at
+        supabase_store.save_signal(skip_row)
+        return None
+
     sent = send_signal(signal)
     signal.sent = sent
     saved = supabase_store.save_signal(signal.to_supabase_row())

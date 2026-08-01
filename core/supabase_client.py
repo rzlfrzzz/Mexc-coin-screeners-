@@ -100,6 +100,47 @@ class SupabaseStore:
         except Exception as e:
             logger.error(f"Gagal update outcome signal {signal_id}: {e}")
 
+    def has_open_signal(self, symbol: str) -> bool:
+        """
+        Cek apakah symbol ini masih punya trade 'open' - yaitu signal yang sudah
+        pernah dikirim (sent=True) tapi outcome-nya belum ditentukan (outcome IS NULL,
+        sama seperti kriteria fetch_open_signals()/outcome_tracker.py).
+
+        FIX DUPLIKASI SIGNAL: dipanggil oleh pipeline.process_and_dispatch() sebelum
+        kirim ke Telegram. Sebelumnya bot mengevaluasi ulang & mengirim signal baru
+        untuk symbol yang sama di SETIAP scan interval (default 5 menit) selama
+        indikatornya masih lolos semua layer - karena trend/struktur biasanya tidak
+        berubah secepat itu, symbol yang sama sering lolos lagi & terkirim lagi
+        (terlihat seperti "double signal"). Dengan cek ini, symbol yang tradenya
+        masih open (belum SL/TP/expired) tidak akan dikirim signal baru sampai
+        outcome_tracker.py menutup trade sebelumnya.
+
+        CATATAN: fitur ini butuh ENABLE_OUTCOME_TRACKING=true supaya trade lama
+        benar-benar bisa "closed" (SL/TP/expired) - kalau outcome tracking mati,
+        symbol yang sudah punya open signal akan terus terblokir dari signal baru
+        tanpa batas waktu.
+        """
+        if not self.client:
+            logger.warning(
+                f"[{symbol}] Supabase tidak terkoneksi, tidak bisa cek duplikasi open signal "
+                "- signal akan tetap dikirim (fail-open)."
+            )
+            return False
+        try:
+            res = (
+                self.client.table(settings.supabase_signals_table)
+                .select("id")
+                .eq("symbol", symbol)
+                .eq("sent", True)
+                .is_("outcome", "null")
+                .limit(1)
+                .execute()
+            )
+            return bool(res.data)
+        except Exception as e:
+            logger.error(f"Gagal cek open signal untuk {symbol}: {e}")
+            return False  # fail-open: kalau cek gagal, jangan blokir pengiriman signal
+
     def fetch_open_signals(self, limit: int = 200) -> list:
         """
         Ambil signal yang sudah terkirim (sent=True) tapi belum punya outcome (outcome IS NULL)

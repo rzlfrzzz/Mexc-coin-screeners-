@@ -26,8 +26,19 @@ def _fmt_pct(val) -> str:
 
 
 def _base_symbol(symbol: str) -> str:
-    """Ambil kode base currency dari symbol ccxt, mis. 'ETH/USDT:USDT' -> 'ETH'."""
-    return symbol.split("/")[0].strip().upper()
+    """Ambil kode base currency dari symbol ccxt, mis. 'ETH/USDT:USDT' -> 'ETH'.
+
+    Khusus untuk ticker kategori Stock di MEXC (mis. 'TESLASTOCK/USDT:USDT',
+    'SAMSUNGSTOCK/USDT:USDT'), nama asli exchange punya suffix 'STOCK' yang
+    tidak dikenali oleh bot pencatat signal eksternal. Suffix ini HANYA
+    dihapus untuk tampilan di pesan Telegram (field 'Pair:') -- tidak
+    mengubah signal.symbol asli yang tetap dipakai untuk fetch candle,
+    cek open-signal di Supabase, dsb.
+    """
+    base = symbol.split("/")[0].strip().upper()
+    if base.endswith("STOCK") and len(base) > len("STOCK"):
+        base = base[: -len("STOCK")]
+    return base
 
 
 DIVIDER = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"

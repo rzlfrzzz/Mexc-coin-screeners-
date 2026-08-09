@@ -93,9 +93,8 @@ def format_signal_message(signal: TradeSignal) -> str:
             "",
             f"TP1   : {rp.tp1:g}",
             f"TP2   : {rp.tp2:g}",
-            f"TP3   : {rp.tp3:g}",
             "",
-            "Risk/Reward: 1:3",
+            "Risk/Reward: 1:2",
             "",
             DIVIDER,
         ]

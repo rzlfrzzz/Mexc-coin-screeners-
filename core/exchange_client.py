@@ -169,23 +169,30 @@ class ExchangeClient:
             logger.warning(f"[{symbol}] Funding rate tidak tersedia ({e}), filter funding di-skip untuk symbol ini")
             return None
 
-    def fetch_open_interest_change_pct(self, symbol: str):
+    def fetch_open_interest_change_pct(self, symbol: str, ticker: dict = None):
         """
-        Ambil Open Interest saat ini via endpoint publik ccxt fetch_open_interest(), lalu
-        bandingkan dengan nilai OI symbol ini yang tercatat pada scan sebelumnya untuk
-        menghasilkan % perubahan OI antar-scan (proxy sederhana untuk "apakah posisi baru
-        sedang dibangun", bukan OI history resmi karena ccxt/MEXC belum tentu menyediakan
-        endpoint historical OI). Return None kalau data tidak tersedia atau ini scan pertama
-        untuk symbol tsb (belum ada baseline pembanding).
+        Ambil Open Interest saat ini, lalu bandingkan dengan nilai OI symbol ini yang
+        tercatat pada scan sebelumnya untuk menghasilkan % perubahan OI antar-scan (proxy
+        sederhana untuk "apakah posisi baru sedang dibangun", bukan OI history resmi).
+        Return None kalau data tidak tersedia atau ini scan pertama untuk symbol tsb
+        (belum ada baseline pembanding).
+
+        PENTING: ccxt.mexc TIDAK meng-implementasikan fetch_open_interest() (selalu raise
+        NotSupported untuk MEXC per ccxt 4.5.x), jadi endpoint itu sengaja TIDAK dipakai.
+        Sebagai gantinya, OI diambil dari field `holdVol` yang dikembalikan MEXC pada
+        endpoint publik GET /api/v1/contract/ticker (satuan: jumlah kontrak/lot yang masih
+        open, bukan nilai notional USD). ccxt menaruh response mentah tsb di ticker["info"],
+        jadi ticker yang sudah difetch di safe_fetch_all() bisa dipakai ulang di sini tanpa
+        request tambahan - kalau tidak diberikan, baru fetch_ticker() sendiri sebagai fallback.
         """
         try:
-            oi_data = self._call_with_retry(self.exchange.fetch_open_interest, symbol)
-            oi_value = oi_data.get("openInterestValue") or oi_data.get("openInterestAmount")
-            if oi_value is None:
+            ticker = ticker if ticker is not None else self._call_with_retry(self.exchange.fetch_ticker, symbol)
+            hold_vol = ticker.get("info", {}).get("holdVol")
+            if hold_vol is None:
                 return None
-            oi_value = float(oi_value)
+            oi_value = float(hold_vol)
         except Exception as e:
-            logger.warning(f"[{symbol}] Open interest tidak tersedia ({e}), OI confirmation di-skip untuk symbol ini")
+            logger.warning(f"[{symbol}] Open interest (holdVol) tidak tersedia ({e}), OI confirmation di-skip untuk symbol ini")
             return None
 
         now = time.time()
@@ -245,7 +252,9 @@ class ExchangeClient:
                 # None kalau tidak didukung/gagal - masing-masing layer wajib menangani None
                 # secara graceful (skip check), bukan menganggapnya sebagai kegagalan fetch total.
                 "funding_rate_pct": self.fetch_funding_rate_pct(symbol),
-                "oi_change_pct": self.fetch_open_interest_change_pct(symbol),
+                # Teruskan ticker yang sudah difetch di atas supaya holdVol (proxy OI)
+                # diambil dari response yang sama, tanpa request tambahan ke exchange.
+                "oi_change_pct": self.fetch_open_interest_change_pct(symbol, ticker=data["ticker"]),
             }
             return data
         except Exception as e:

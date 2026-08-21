@@ -243,9 +243,10 @@ class ExchangeClient:
         """
         try:
             symbol = self.normalize_symbol(symbol)
+            ticker = self.fetch_ticker(symbol)
             data = {
                 "symbol": symbol,
-                "ticker": self.fetch_ticker(symbol),
+                "ticker": ticker,
                 "spread_pct": self.fetch_order_book_spread_pct(symbol),
                 "ohlcv_htf": self.fetch_ohlcv_df(symbol, settings.tf_htf, limit=300),
                 "ohlcv_mtf": self.fetch_ohlcv_df(symbol, settings.tf_mtf, limit=300),
@@ -254,7 +255,7 @@ class ExchangeClient:
                 "funding_rate_pct": self.fetch_funding_rate_pct(symbol),
                 # Teruskan ticker yang sudah difetch di atas supaya holdVol (proxy OI)
                 # diambil dari response yang sama, tanpa request tambahan ke exchange.
-                "oi_change_pct": self.fetch_open_interest_change_pct(symbol, ticker=data["ticker"]),
+                "oi_change_pct": self.fetch_open_interest_change_pct(symbol, ticker=ticker),
             }
             return data
         except Exception as e:

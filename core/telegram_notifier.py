@@ -86,6 +86,13 @@ def format_signal_message(signal: TradeSignal) -> str:
 
     if signal.risk_plan:
         rp = signal.risk_plan
+        # Hitung RR ke TP2 langsung dari angka entry/sl/tp2 yang sebenarnya,
+        # bukan label statis - supaya kalau logika perhitungan TP di layer 8
+        # berubah suatu saat, pesan yang tampil ke user tetap konsisten dan
+        # tidak pernah menampilkan RR yang salah/menyesatkan.
+        risk = abs(rp.entry - rp.sl)
+        reward_tp2 = abs(rp.tp2 - rp.entry)
+        rr_tp2 = (reward_tp2 / risk) if risk > 0 else 0
         lines += [
             "💰 <b>Trade Setup</b>",
             f"Entry : {rp.entry:g}",
@@ -94,7 +101,7 @@ def format_signal_message(signal: TradeSignal) -> str:
             f"TP1   : {rp.tp1:g}",
             f"TP2   : {rp.tp2:g}",
             "",
-            "Risk/Reward: 1:2",
+            f"Risk/Reward: 1:{rr_tp2:.1f}",
             "",
             DIVIDER,
         ]

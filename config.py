@@ -150,6 +150,14 @@ class Settings:
     swing_lookback_low_atr_pct: float = _get_float("SWING_LOOKBACK_LOW_ATR_PCT", 0.5)
     swing_lookback_high_atr_pct: float = _get_float("SWING_LOOKBACK_HIGH_ATR_PCT", 1.5)
 
+    # Layer 8 - Risk Management sanity check.
+    # Batas atas jarak SL dari entry (dalam % dari harga entry). Kalau swing
+    # reference yang ditemukan terlalu jauh dari harga sekarang (misal karena
+    # swing high/low lama sebelum crash/pump besar), risk yang dihasilkan bisa
+    # tidak masuk akal (bahkan bikin TP jadi harga negatif untuk SHORT). Sinyal
+    # dengan risk > max_risk_pct dari entry akan di-FAIL, bukan diteruskan.
+    max_risk_pct: float = _get_float("MAX_RISK_PCT", 20.0)
+
     # Layer 6b - Open Interest confirmation (soft/scoring, bukan hard block - data OI
     # via ccxt/MEXC tidak selalu tersedia/stabil, jadi tidak dijadikan syarat wajib)
     oi_confirmation_min_change_pct: float = _get_float("OI_CONFIRMATION_MIN_CHANGE_PCT", 2.0)

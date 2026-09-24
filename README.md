@@ -15,18 +15,24 @@ yang tidak didukung di Python 3.9 ke bawah).
 
 ## Struktur Layer
 
-| # | Layer | Fungsi | Tipe Gate |
-|---|-------|--------|-----------|
-| 0 | BTC Market Regime | Trend 4H BTC (EMA200) harus align dengan direction altcoin | **Hard** (toggleable) |
-| 1 | Market Health | Volume, spread, ATR, pump/dump ekstrem, funding rate ekstrem | **Hard** |
-| 2 | Trend Besar (4H) | EMA200 4H -> tentukan mode LONG/SHORT only | **Hard** |
-| 3 | Market Structure (1H) | Swing HH/HL/LH/LL, BOS, CHoCH (adaptive fractal lookback) | **Hard** |
-| 4 | Smart Money Area | Order Block, Fair Value Gap, Liquidity Sweep | **Soft** (scoring) |
-| 5 | Konfirmasi Momentum | RSI(14), MACD histogram | **Soft** (scoring) |
-| 6 | Volume | Volume 1H vs SMA20 Volume | **Soft** (scoring) |
-| 7 | Entry Trigger | Pattern konfirmasi (engulfing / breakout close) | **Hard** |
-| 8 | Risk Management | Hitung Entry/SL/TP1/TP2/TP3 otomatis | **Hard** |
-| 9 | Scoring System | Skor 0-100 (termasuk BTC regime & OI confirmation), kirim jika >=70 | **Hard** (threshold) |
+| # | Layer | Timeframe | Fungsi | Tipe Gate |
+|---|-------|-----------|--------|-----------|
+| 0 | BTC Market Regime | TF_HTF (4H) | Trend 4H BTC (EMA200) harus align dengan direction altcoin | **Hard** (toggleable) |
+| 1 | Market Health | TF_STRUCTURE (1H) | Volume, spread, ATR, pump/dump ekstrem, funding rate ekstrem | **Hard** |
+| 2 | Trend Besar (4H) | TF_HTF (4H) | EMA200 4H -> tentukan mode LONG/SHORT only | **Hard** |
+| 3 | Market Structure | TF_STRUCTURE (1H) | Swing HH/HL/LH/LL, BOS, CHoCH (adaptive fractal lookback) | **Hard** |
+| 4 | Smart Money Area | TF_STRUCTURE (1H) | Order Block, Fair Value Gap, Liquidity Sweep | **Soft** (scoring) |
+| 5 | Konfirmasi Momentum | TF_ENTRY (15M) | RSI(14), MACD histogram | **Soft** (scoring) |
+| 6 | Volume | TF_ENTRY (15M) | Volume candle entry vs SMA20 Volume | **Soft** (scoring) |
+| 7 | Entry Trigger | TF_ENTRY (15M) | Pattern konfirmasi (engulfing / breakout close) | **Hard** |
+| 8 | Risk Management | Entry: TF_ENTRY, SL: TF_STRUCTURE | Hitung Entry/SL/TP1/TP2/TP3 otomatis | **Hard** |
+| 9 | Scoring System | - | Skor 0-100 (termasuk BTC regime & OI confirmation), kirim jika >=70 | **Hard** (threshold) |
+
+**V2 - Pemisahan timeframe:** sebelumnya satu timeframe (`TF_MTF`, default 1H) dipakai untuk
+Layer 3-7 sekaligus. Sekarang dipisah jadi `TF_STRUCTURE` (1H - struktur besar & SMC, tidak
+perlu granular) dan `TF_ENTRY` (15M - momentum/volume/trigger, harus setepat mungkin) supaya
+trigger entry tidak menunggu candle 1H selesai dan tidak tercampur dengan noise struktur besar
+(lihat `ringkasan_perbaikan.md` bagian P1).
 
 **Desain fail-fast vs soft-scoring:** Layer 0/1/2/3/7/8 adalah prasyarat struktural (tanpa
 salah satunya, sinyal tidak valid sama sekali atau tidak punya arah/SL) sehingga tetap

@@ -1,8 +1,11 @@
 """
 Layer 6 - Volume
 -----------------
-Breakout/entry harus didukung volume:
-Volume 1H saat ini > SMA20(Volume) x 1.5
+Breakout/entry harus didukung volume, dihitung di timeframe ENTRY (default 15m,
+settings.tf_entry) - bukan timeframe structure - karena volume spike yang relevan untuk
+konfirmasi entry adalah volume candle entry itu sendiri (lihat ringkasan_perbaikan.md
+P1.7):
+Volume candle entry saat ini > SMA20(Volume, timeframe entry) x 1.5
 Breakout tanpa volume dianggap tidak valid -> skip.
 """
 
@@ -12,8 +15,8 @@ from indicators.technical import sma
 
 
 def run(raw_data: dict) -> LayerResult:
-    df_mtf = raw_data["ohlcv_mtf"]
-    volume = df_mtf["volume"]
+    df_entry = raw_data["ohlcv_entry"]
+    volume = df_entry["volume"]
 
     vol_sma20 = sma(volume, 20)
     current_vol = float(volume.iloc[-1])

@@ -101,15 +101,15 @@ def label_swings(swings: list) -> list:
 
 
 def run(raw_data: dict) -> LayerResult:
-    df_mtf = raw_data["ohlcv_mtf"]
+    df_structure = raw_data["ohlcv_structure"]  # default 1H (settings.tf_structure)
 
     # Adaptive lookback dihitung sekali di sini lalu disimpan ke raw_data supaya Layer 4
     # (order block / liquidity sweep) dan Layer 8 (swing ref untuk SL) memakai nilai yang
     # persis sama - konsisten satu symbol, satu lookback, bukan tiap layer hitung sendiri.
-    swing_lookback = compute_adaptive_lookback(df_mtf)
+    swing_lookback = compute_adaptive_lookback(df_structure)
     raw_data["swing_lookback"] = swing_lookback
 
-    swings = find_swings(df_mtf, lookback=swing_lookback)
+    swings = find_swings(df_structure, lookback=swing_lookback)
 
     if len(swings) < 4:
         return LayerResult(3, "Market Structure 1H", LayerStatus.FAIL,
@@ -119,7 +119,7 @@ def run(raw_data: dict) -> LayerResult:
     labeled = label_swings(swings)
     recent_labels = [s["label"] for s in labeled if s["label"] is not None][-4:]
 
-    last_close = df_mtf["close"].iloc[-1]
+    last_close = df_structure["close"].iloc[-1]
     last_high_swing = next((s for s in reversed(labeled) if s["type"] == "high"), None)
     last_low_swing = next((s for s in reversed(labeled) if s["type"] == "low"), None)
 

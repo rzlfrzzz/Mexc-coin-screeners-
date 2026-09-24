@@ -26,17 +26,23 @@ Cara pakai:
     python backtest.py --symbols BTC/USDT:USDT --days 60 --grid-search
 
 Metodologi:
-- Untuk tiap symbol, ambil OHLCV historis (4H untuk trend, 1H untuk struktur/entry).
-- Jalan maju bar-demi-bar di timeframe 1H (mulai dari titik dengan warmup data cukup,
-  default 300 candle ~12.5 hari, supaya EMA200 4H & indikator lain valid).
+- Untuk tiap symbol, ambil OHLCV historis di 3 timeframe (P1 - Pisahkan Timeframe):
+  TF_HTF (4H, trend besar), TF_STRUCTURE (1H, struktur/SMC), TF_ENTRY (15M, momentum/
+  volume/entry trigger) - plus TF_OUTCOME (default 15m, sama dengan TF_ENTRY secara
+  default tapi konfigurasi independen) khusus untuk menentukan outcome trade.
+- Jalan maju bar-demi-bar di timeframe STRUCTURE (mulai dari titik dengan warmup data
+  cukup, default 300 candle ~12.5 hari, supaya EMA200 4H & indikator lain valid).
 - Di tiap bar, jalankan Layer 1 -> 9 PERSIS seperti pipeline.py (termasuk Layer 0 BTC
   regime kalau BTC data disediakan, dan soft-fail Layer 4-6) menggunakan HANYA data yang
   "sudah diketahui" pada bar tersebut (tidak ada lookahead bias - df di-slice sampai bar
   ini saja).
-- Kalau lolos skor minimum, catat sebagai sinyal, lalu simulasikan maju dari bar berikutnya
-  untuk menentukan outcome (SL/TP1/2/3 mana yang tersentuh duluan, asumsi konservatif SL
-  duluan kalau sama-sama tersentuh dalam 1 candle). Satu posisi terbuka per symbol pada
-  satu waktu (tidak overlap) - standar praktik backtest.
+- Kalau lolos skor minimum, catat sebagai sinyal, lalu outcome-nya ditentukan lewat
+  trade_outcome.evaluate_trade_path() - fungsi TERPUSAT yang SAMA dengan yang dipakai
+  outcome_tracker.py (live) - berjalan di atas candle settings.tf_outcome (bukan candle
+  sinyal 1H) supaya urutan SL-vs-TP di dalam satu candle sinyal bisa dibedakan, bukan
+  ditebak. Outcome = event PERTAMA yang tersentuh (TP1_FIRST/TP2_FIRST/TP3_FIRST/SL_FIRST),
+  atau OPEN_EXPIRED kalau belum tersentuh apa pun sampai MAX_HOLDING_HOURS. Satu posisi
+  terbuka per symbol pada satu waktu (tidak overlap) - standar praktik backtest.
 - funding_rate_pct dan oi_change_pct historis TIDAK disimulasikan (data historis funding/OI
   granular tidak selalu tersedia gratis) - filter funding di Layer 1 otomatis di-skip untuk
   backtest (None = graceful skip, sesuai desain layer aslinya), OI confirmation di scoring
@@ -56,6 +62,7 @@ from loguru import logger
 from config import settings
 from models import Direction, LayerStatus
 from core.exchange_client import exchange_client
+from trade_outcome import evaluate_trade_path, OPEN_EXPIRED
 from layers import (
     layer1_market_health, layer2_trend, layer3_structure,
     layer4_smart_money, layer5_momentum, layer6_volume,
@@ -63,7 +70,7 @@ from layers import (
 )
 
 WARMUP_BARS = 300
-MAX_HOLDING_BARS = 24 * 7  # 7 hari dalam candle 1H - kalau belum SL/TP sampai sini, dianggap timeout
+MAX_HOLDING_HOURS = 24 * 7  # 7 hari - kalau belum SL/TP sampai sini, dianggap OPEN_EXPIRED (timeout)
 
 
 def _check_btc_regime(direction: Direction, btc_htf_slice: pd.DataFrame):
@@ -83,39 +90,29 @@ def _check_btc_regime(direction: Direction, btc_htf_slice: pd.DataFrame):
     return btc_direction == direction.value, btc_direction
 
 
-def _pnl_pct(direction: Direction, entry: float, exit_price: float) -> float:
-    if direction == Direction.LONG:
-        return (exit_price - entry) / entry * 100
-    return (entry - exit_price) / entry * 100
-
-
-def _simulate_outcome(df_mtf_full: pd.DataFrame, start_idx: int, direction: Direction,
+def _simulate_outcome(df_outcome_full: pd.DataFrame, signal_ts: pd.Timestamp, direction: Direction,
                        entry: float, sl: float, tp1: float, tp2: float, tp3: float):
-    """Jalan maju dari start_idx+1 untuk menentukan outcome. Return (outcome, pnl_pct, bars_held)."""
-    tp_targets = [("WIN_TP1", tp1), ("WIN_TP2", tp2), ("WIN_TP3", tp3)]
-    best_tp = None
+    """
+    Tentukan outcome memakai trade_outcome.evaluate_trade_path() - fungsi TERPUSAT yang
+    juga dipakai outcome_tracker.py (live), supaya backtest dan live tidak pernah punya
+    definisi "win" yang berbeda (lihat ringkasan_perbaikan.md P0.2).
 
-    end_idx = min(start_idx + MAX_HOLDING_BARS, len(df_mtf_full) - 1)
-    for j in range(start_idx + 1, end_idx + 1):
-        low = float(df_mtf_full["low"].iloc[j])
-        high = float(df_mtf_full["high"].iloc[j])
+    df_outcome_full : OHLCV pada timeframe GRANULAR (settings.tf_outcome, mis. 15m),
+    bukan df_structure_full (timeframe sinyal) - supaya urutan SL-vs-TP di dalam satu
+    candle sinyal bisa dibedakan, bukan ditebak.
 
-        sl_hit = (low <= sl) if direction == Direction.LONG else (high >= sl)
-        if sl_hit:
-            return "LOSS_SL", round(_pnl_pct(direction, entry, sl), 4), j - start_idx
+    Return None kalau tidak ada cukup data outcome ke depan untuk signal ini (mis. signal
+    ini terlalu dekat dengan ujung dataset) - caller sebaiknya skip signal ini, jangan
+    dicatat dengan outcome yang tidak valid.
+    """
+    window_end = signal_ts + pd.Timedelta(hours=MAX_HOLDING_HOURS)
+    window = df_outcome_full[(df_outcome_full.index > signal_ts) & (df_outcome_full.index <= window_end)]
 
-        for i, (label, tp) in enumerate(tp_targets):
-            reached = (high >= tp) if direction == Direction.LONG else (low <= tp)
-            if reached and (best_tp is None or i > best_tp):
-                best_tp = i
-
-    if best_tp is not None:
-        label, tp = tp_targets[best_tp]
-        return label, round(_pnl_pct(direction, entry, tp), 4), end_idx - start_idx
-
-    # timeout: belum SL/TP sampai batas holding period, hitung PnL unrealized di titik akhir
-    last_close = float(df_mtf_full["close"].iloc[end_idx])
-    return "TIMEOUT", round(_pnl_pct(direction, entry, last_close), 4), end_idx - start_idx
+    return evaluate_trade_path(
+        window, direction.value, entry, sl, tp1, tp2, tp3,
+        entry_time=signal_ts.to_pydatetime(),
+        same_bar_policy=settings.outcome_same_bar_policy,
+    )
 
 
 @dataclass
@@ -132,38 +129,53 @@ class BacktestRecord:
     tp3: float
     outcome: str
     pnl_pct: float
-    bars_held: int
+    hours_held: float
+    mfe_pct: float
+    mae_pct: float
+    ambiguous_same_bar: bool
     soft_fail_layers: list = field(default_factory=list)
 
 
-def simulate_symbol(symbol: str, df_htf_full: pd.DataFrame, df_mtf_full: pd.DataFrame,
+ENTRY_WARMUP_BARS = 30  # cukup untuk SMA20 volume (Layer 6) & lookback breakout 20 (Layer 7)
+
+
+def simulate_symbol(symbol: str, df_htf_full: pd.DataFrame, df_structure_full: pd.DataFrame,
+                     df_entry_full: pd.DataFrame, df_outcome_full: pd.DataFrame,
                      btc_htf_full: pd.DataFrame = None) -> list:
     """
-    Jalan maju bar-by-bar di df_mtf_full, jalankan pipeline layer (memakai ulang modul layer
-    asli) memakai data yang di-slice sampai bar tsb saja (no lookahead), catat sinyal & outcome.
+    Jalan maju bar-by-bar di df_structure_full (timeframe structure, default 1H), jalankan
+    pipeline layer (memakai ulang modul layer asli) memakai data yang di-slice sampai bar
+    tsb saja (no lookahead), catat sinyal & outcome.
+
+    df_entry_full : OHLCV timeframe ENTRY (default 15m, settings.tf_entry) - dipakai Layer
+    5/6/7/8 persis seperti raw_data["ohlcv_entry"] di live pipeline (lihat config.py P1 -
+    Pisahkan Timeframe), di-slice sampai timestamp CANDLE STRUCTURE saat ini saja (tidak
+    boleh mengintip candle entry yang closed-nya setelah candle structure ini closed).
     """
     records = []
     i = WARMUP_BARS
-    n = len(df_mtf_full)
+    n = len(df_structure_full)
 
     while i < n - 1:
-        df_mtf = df_mtf_full.iloc[: i + 1]
-        current_ts = df_mtf.index[-1]
+        df_structure = df_structure_full.iloc[: i + 1]
+        current_ts = df_structure.index[-1]
         df_htf = df_htf_full[df_htf_full.index <= current_ts]
+        df_entry = df_entry_full[df_entry_full.index <= current_ts]
 
-        if len(df_htf) < 210 or len(df_mtf) < WARMUP_BARS:
+        if len(df_htf) < 210 or len(df_structure) < WARMUP_BARS or len(df_entry) < ENTRY_WARMUP_BARS:
             i += 1
             continue
 
         raw_data = {
             "symbol": symbol,
             "ticker": {
-                "quoteVolume": float(df_mtf["volume"].tail(24).sum() * df_mtf["close"].iloc[-1]),
-                "last": float(df_mtf["close"].iloc[-1]),
+                "quoteVolume": float(df_structure["volume"].tail(24).sum() * df_structure["close"].iloc[-1]),
+                "last": float(df_entry["close"].iloc[-1]),
             },
             "spread_pct": 0.03,  # data spread historis tidak tersedia - asumsi tight & konstan
             "ohlcv_htf": df_htf,
-            "ohlcv_mtf": df_mtf,
+            "ohlcv_structure": df_structure,
+            "ohlcv_entry": df_entry,
             "funding_rate_pct": None,  # data funding historis tidak disimulasikan (lihat docstring modul)
             "oi_change_pct": None,     # data OI historis tidak disimulasikan (lihat docstring modul)
         }
@@ -226,19 +238,36 @@ def simulate_symbol(symbol: str, df_htf_full: pd.DataFrame, df_mtf_full: pd.Data
             i += 1
             continue
 
-        outcome, pnl_pct, bars_held = _simulate_outcome(
-            df_mtf_full, i, direction, risk_plan.entry, risk_plan.sl, risk_plan.tp1, risk_plan.tp2, risk_plan.tp3
+        outcome_result = _simulate_outcome(
+            df_outcome_full, current_ts, direction,
+            risk_plan.entry, risk_plan.sl, risk_plan.tp1, risk_plan.tp2, risk_plan.tp3,
+        )
+        if outcome_result is None:
+            # Tidak ada cukup data outcome ke depan (signal terlalu dekat ujung dataset) -
+            # jangan dicatat dengan outcome yang tidak valid.
+            i += 1
+            continue
+
+        outcome_label = OPEN_EXPIRED if outcome_result.still_open else outcome_result.outcome
+        hours_held = (
+            round(outcome_result.time_to_outcome_seconds / 3600, 4)
+            if outcome_result.time_to_outcome_seconds is not None else None
         )
 
         records.append(BacktestRecord(
             symbol=symbol, generated_at=str(current_ts), direction=direction.value,
             score=score.total, grade=score.grade, entry=risk_plan.entry, sl=risk_plan.sl,
             tp1=risk_plan.tp1, tp2=risk_plan.tp2, tp3=risk_plan.tp3,
-            outcome=outcome, pnl_pct=pnl_pct, bars_held=bars_held, soft_fail_layers=soft_fail,
+            outcome=outcome_label, pnl_pct=outcome_result.pnl_pct, hours_held=hours_held,
+            mfe_pct=outcome_result.mfe_pct, mae_pct=outcome_result.mae_pct,
+            ambiguous_same_bar=outcome_result.ambiguous_same_bar, soft_fail_layers=soft_fail,
         ))
 
-        # satu posisi per symbol pada satu waktu - loncat ke setelah trade ini selesai
-        i += max(bars_held, 1)
+        # satu posisi per symbol pada satu waktu - loncat ke bar mtf pertama SETELAH
+        # trade ini closed (bukan +1 candle tetap), supaya tidak overlap dgn trade berikutnya.
+        closed_dt = pd.Timestamp(outcome_result.closed_at)
+        next_i = int(df_structure_full.index.searchsorted(closed_dt, side="right"))
+        i = max(next_i, i + 1)
 
     return records
 
@@ -257,13 +286,39 @@ def run_backtest(symbols: list, days: int = 60, include_btc_regime: bool = True)
         symbol = exchange_client.normalize_symbol(symbol)
         logger.info(f"Backtest {symbol}: mengambil data historis...")
         df_htf_full = exchange_client.fetch_ohlcv_df(symbol, settings.tf_htf, limit=limit // 4)
-        df_mtf_full = exchange_client.fetch_ohlcv_df(symbol, settings.tf_mtf, limit=limit)
+        df_structure_full = exchange_client.fetch_ohlcv_df(symbol, settings.tf_structure, limit=limit)
 
-        if len(df_mtf_full) < WARMUP_BARS + 10:
+        if len(df_structure_full) < WARMUP_BARS + 10:
             logger.warning(f"[{symbol}] Data historis tidak cukup, skip.")
             continue
 
-        records = simulate_symbol(symbol, df_htf_full, df_mtf_full, btc_htf_full)
+        since_ms = int(df_structure_full.index[0].timestamp() * 1000)
+
+        # Data timeframe ENTRY (settings.tf_entry, default 15m) - dipaginasi supaya
+        # mencakup seluruh window backtest, dipakai Layer 5/6/7/8 (lihat P1 - Pisahkan
+        # Timeframe). Kalau TF_ENTRY == TF_OUTCOME (default sama-sama 15m), pakai ulang
+        # hasil fetch yang sama supaya tidak dobel request ke exchange.
+        logger.info(f"[{symbol}] Mengambil data entry-timeframe ({settings.tf_entry})...")
+        df_entry_full = exchange_client.fetch_ohlcv_range_df(symbol, settings.tf_entry, since_ms)
+
+        if df_entry_full.empty:
+            logger.warning(f"[{symbol}] Data entry-timeframe ({settings.tf_entry}) tidak tersedia, skip symbol.")
+            continue
+
+        # Data outcome-checking pada timeframe GRANULAR (settings.tf_outcome), dipaginasi
+        # supaya mencakup seluruh window backtest + buffer holding period di ujung -
+        # lihat trade_outcome.py untuk kenapa ini harus lebih granular dari tf_structure.
+        if settings.tf_outcome == settings.tf_entry:
+            df_outcome_full = df_entry_full
+        else:
+            logger.info(f"[{symbol}] Mengambil data outcome-checking ({settings.tf_outcome})...")
+            df_outcome_full = exchange_client.fetch_ohlcv_range_df(symbol, settings.tf_outcome, since_ms)
+
+        if df_outcome_full.empty:
+            logger.warning(f"[{symbol}] Data outcome-checking ({settings.tf_outcome}) tidak tersedia, skip symbol.")
+            continue
+
+        records = simulate_symbol(symbol, df_htf_full, df_structure_full, df_entry_full, df_outcome_full, btc_htf_full)
         logger.info(f"[{symbol}] {len(records)} sinyal historis ditemukan.")
         all_records.extend(records)
 
@@ -277,25 +332,32 @@ def summarize(df: pd.DataFrame) -> dict:
     if df.empty:
         return {"total_signals": 0}
 
-    closed = df[df["outcome"] != "TIMEOUT"]
-    wins = df[df["outcome"].str.startswith("WIN")]
-    losses = df[df["outcome"] == "LOSS_SL"]
+    closed = df[df["outcome"] != OPEN_EXPIRED]
+    wins = df[df["outcome"].isin(["TP1_FIRST", "TP2_FIRST", "TP3_FIRST"])]
+    losses = df[df["outcome"] == "SL_FIRST"]
 
     win_rate = len(wins) / len(closed) * 100 if len(closed) else 0.0
     avg_pnl = df["pnl_pct"].mean()
     avg_win_pnl = wins["pnl_pct"].mean() if len(wins) else 0.0
     avg_loss_pnl = losses["pnl_pct"].mean() if len(losses) else 0.0
     expectancy = (win_rate / 100 * avg_win_pnl) + ((1 - win_rate / 100) * avg_loss_pnl) if len(closed) else 0.0
+    ambiguous_count = int(df["ambiguous_same_bar"].sum()) if "ambiguous_same_bar" in df else 0
 
     return {
         "total_signals": len(df),
         "closed": len(closed),
-        "timeout": len(df) - len(closed),
+        "open_expired": len(df) - len(closed),
         "win_rate_pct": round(win_rate, 2),
         "avg_pnl_pct": round(avg_pnl, 3),
         "avg_win_pnl_pct": round(avg_win_pnl, 3),
         "avg_loss_pnl_pct": round(avg_loss_pnl, 3),
         "expectancy_pct_per_trade": round(expectancy, 3),
+        "avg_mfe_pct": round(df["mfe_pct"].mean(), 3) if "mfe_pct" in df else None,
+        "avg_mae_pct": round(df["mae_pct"].mean(), 3) if "mae_pct" in df else None,
+        "ambiguous_same_bar_count": ambiguous_count,
+        "tp1_first_count": int((df["outcome"] == "TP1_FIRST").sum()),
+        "tp2_first_count": int((df["outcome"] == "TP2_FIRST").sum()),
+        "tp3_first_count": int((df["outcome"] == "TP3_FIRST").sum()),
         "grade_A+_count": int((df["grade"] == "A+").sum()),
         "grade_A_count": int((df["grade"] == "A").sum()),
         "grade_B_count": int((df["grade"] == "B").sum()),

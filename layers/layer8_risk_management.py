@@ -26,10 +26,13 @@ SL_BUFFER_PCT = 0.05  # buffer kecil di bawah/atas swing supaya tidak kena wick 
 
 
 def run(raw_data: dict, direction: Direction) -> tuple[LayerResult, RiskPlan | None]:
-    df_mtf = raw_data["ohlcv_mtf"]
-    entry = float(df_mtf["close"].iloc[-1])
+    # Harga ENTRY dari timeframe entry (default 15m, settings.tf_entry) - lebih fresh
+    # daripada close candle structure (1H) yang bisa ketinggalan sampai ~1 jam. SL tetap
+    # dari swing di timeframe STRUCTURE (invalidasi struktural, bukan noise 15m).
+    df_structure = raw_data["ohlcv_structure"]
+    entry = float(raw_data["ohlcv_entry"]["close"].iloc[-1])
     swing_lookback = raw_data.get("swing_lookback")
-    swings = find_swings(df_mtf) if swing_lookback is None else find_swings(df_mtf, lookback=swing_lookback)
+    swings = find_swings(df_structure) if swing_lookback is None else find_swings(df_structure, lookback=swing_lookback)
 
     if direction == Direction.LONG:
         lows = [s for s in swings if s["type"] == "low" and s["price"] < entry]

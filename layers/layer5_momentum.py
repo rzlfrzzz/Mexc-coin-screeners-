@@ -1,7 +1,10 @@
 """
 Layer 5 - Konfirmasi Momentum
 -------------------------------
-Indikator dipakai sebagai konfirmasi tambahan, bukan penentu utama arah:
+Indikator dipakai sebagai konfirmasi tambahan, bukan penentu utama arah, dihitung di
+timeframe ENTRY (default 15m, settings.tf_entry) - bukan timeframe structure - karena
+momentum yang relevan untuk keputusan entry adalah momentum jangka pendek saat ini,
+bukan momentum di timeframe struktur besar (lihat ringkasan_perbaikan.md P1.6):
 - RSI(14): LONG jika >55, SHORT jika <45
 - MACD   : histogram mulai membesar searah direction
 """
@@ -12,8 +15,8 @@ from indicators.technical import rsi, macd
 
 
 def run(raw_data: dict, direction: Direction) -> LayerResult:
-    df_mtf = raw_data["ohlcv_mtf"]
-    close = df_mtf["close"]
+    df_entry = raw_data["ohlcv_entry"]
+    close = df_entry["close"]
 
     rsi_series = rsi(close, 14)
     current_rsi = float(rsi_series.iloc[-1])

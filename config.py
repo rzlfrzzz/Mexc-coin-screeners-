@@ -66,8 +66,34 @@ class Settings:
     watchlist_refresh_hours: float = _get_float("WATCHLIST_REFRESH_HOURS", 12)
     watchlist_quote: str = os.getenv("WATCHLIST_QUOTE", "USDT")
 
-    tf_htf: str = os.getenv("TF_HTF", "4h")   # untuk Layer 2 (trend besar)
-    tf_mtf: str = os.getenv("TF_MTF", "1h")   # untuk Layer 3-7 (struktur, SMC, momentum, volume)
+    tf_htf: str = os.getenv("TF_HTF", "4h")   # Layer 2 (trend besar) & Layer 0 (BTC regime)
+
+    # ---------- Pemisahan timeframe V2 (lihat ringkasan_perbaikan.md P1) ----------
+    # Sebelumnya satu timeframe (TF_MTF, default 1h) dipakai untuk SEMUANYA: struktur,
+    # SMC, momentum, DAN volume/entry trigger - padahal secara konsep struktur besar
+    # (BOS/CHoCH/OB/FVG) semestinya dibaca di timeframe lebih besar daripada trigger
+    # entry aktual. V2 memisahkannya jadi dua:
+    #   TF_STRUCTURE (default 1h) -> Layer 1 (ATR/pump-dump), Layer 3 (struktur/BOS/CHoCH),
+    #                                 Layer 4 (SMC: OB/FVG/liquidity sweep)
+    #   TF_ENTRY     (default 15m)-> Layer 5 (momentum), Layer 6 (volume), Layer 7 (entry
+    #                                 trigger/displacement), dan harga "entry" aktual di Layer 8
+    # TF_MTF (nama lama) tetap dibaca sebagai FALLBACK kalau TF_STRUCTURE belum diset di
+    # .env, supaya .env lama tidak langsung rusak setelah upgrade - tapi TF_STRUCTURE adalah
+    # nama yang seharusnya dipakai mulai sekarang.
+    tf_structure: str = os.getenv("TF_STRUCTURE", os.getenv("TF_MTF", "1h"))
+    tf_entry: str = os.getenv("TF_ENTRY", "15m")
+
+    # ---------- Outcome evaluation (trade_outcome.py) ----------
+    # Timeframe untuk MENGECEK apakah SL/TP tersentuh - HARUS lebih granular daripada
+    # tf_structure (timeframe sinyal), supaya urutan kejadian SL-vs-TP di dalam satu candle
+    # sinyal bisa dibedakan (lihat ringkasan_perbaikan.md P0: "Signal = 15M, Outcome
+    # checking = 1M/5M", di sini digeneralisasi relatif terhadap tf_structure).
+    tf_outcome: str = os.getenv("TF_OUTCOME", "15m")
+    # Kalau SL & TP tersentuh di CANDLE tf_outcome YANG SAMA (masih ambigu walau sudah
+    # granular), urutan mana yang diasumsikan menang:
+    # "conservative_sl_first" (default, tidak melebih-lebihkan win rate) atau
+    # "conservative_tp_first" (upper-bound optimistis, dipakai hanya untuk sensitivity check).
+    outcome_same_bar_policy: str = os.getenv("OUTCOME_SAME_BAR_POLICY", "conservative_sl_first")
 
     scan_interval_seconds: int = _get_int("SCAN_INTERVAL_SECONDS", 300)
 

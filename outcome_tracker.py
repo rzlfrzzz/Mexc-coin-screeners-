@@ -2,9 +2,8 @@
 outcome_tracker.py
 --------------------
 Proses tracking outcome OTOMATIS untuk sinyal yang sudah terkirim: mengecek pergerakan
-harga sejak `generated_at` untuk menentukan apakah SL tersentuh duluan (LOSS) atau
-TP1/TP2/TP3 tersentuh (WIN), lalu menulis hasilnya ke Supabase (kolom outcome/pnl_pct/
-closed_at yang di skema sudah ada tapi sebelumnya tidak pernah diisi otomatis).
+harga sejak `generated_at` untuk menentukan outcome-nya, lalu menulis hasilnya ke
+Supabase (kolom outcome/pnl_pct/closed_at/mfe_pct/mae_pct/time_to_outcome_hours).
 
 Tanpa ini, win-rate riil bot TIDAK PERNAH bisa diketahui - kolom outcome akan selamanya
 NULL dan tidak ada cara mengevaluasi apakah threshold/parameter bot ini benar-benar
@@ -14,18 +13,20 @@ Cara pakai:
     python outcome_tracker.py          # jalankan sekali
 Atau import track_outcomes() dan panggil berkala dari scheduler (lihat main.py).
 
-Metodologi (disederhanakan, cocok untuk tracking otomatis tanpa data tick-by-tick):
-- Ambil candle 15m sejak generated_at sampai sekarang.
-- Jalan maju candle demi candle secara kronologis:
-  - Kalau low candle (LONG) / high candle (SHORT) menyentuh SL -> LOSS, berhenti di situ.
-    (Asumsi konservatif: kalau SL dan TP tersentuh di candle yang sama, SL dianggap
-    tersentuh lebih dulu - menghindari melebih-lebihkan win rate.)
-  - Kalau tidak, cek apakah TP1/TP2/TP3 tersentuh (progresif, TP tertinggi yang valid
-    tercapai dalam urutan candle yang sama dicatat).
-- Kalau sampai sekarang belum ada yang tersentuh:
-  - Umur signal < outcome_max_age_hours -> tetap OPEN, tidak diupdate (dicek lagi nanti).
-  - Umur signal >= outcome_max_age_hours -> ditandai OPEN_EXPIRED dengan pnl_pct unrealized
-    (harga sekarang vs entry), supaya tidak menggantung selamanya di query "open signals".
+Metodologi
+----------
+Definisi "outcome" (event PERTAMA yang tersentuh, bukan level terjauh yang PERNAH
+tersentuh) dipusatkan di trade_outcome.evaluate_trade_path() - fungsi yang SAMA persis
+dipakai backtest.py, supaya live dan backtest tidak pernah punya jawaban berbeda untuk
+kejadian yang sama (lihat ringkasan_perbaikan.md P0 & P0.2).
+
+- Candle dicek pada timeframe settings.tf_outcome (default 15m - lebih granular dari
+  timeframe sinyal tf_structure) sejak generated_at, supaya urutan SL-vs-TP bisa dibedakan.
+- Kalau outcome sudah ketemu (TP1/2/3_FIRST atau SL_FIRST) -> tulis ke Supabase.
+- Kalau belum ada apa pun yang tersentuh:
+  - umur signal < outcome_max_age_hours -> tetap OPEN, tidak diupdate (dicek lagi nanti).
+  - umur signal >= outcome_max_age_hours -> OPEN_EXPIRED, pakai pnl_pct/mfe/mae unrealized
+    dari candle terakhir yang tersedia, supaya tidak menggantung selamanya.
 """
 
 import sys
@@ -36,20 +37,14 @@ from loguru import logger
 from config import settings
 from core.exchange_client import exchange_client
 from core.supabase_client import supabase_store
-
-TRACKING_TIMEFRAME = "15m"
-
-
-def _pnl_pct(direction: str, entry: float, exit_price: float) -> float:
-    if direction == "LONG":
-        return (exit_price - entry) / entry * 100
-    return (entry - exit_price) / entry * 100
+from trade_outcome import evaluate_trade_path, OPEN_EXPIRED
 
 
 def _evaluate_signal(row: dict) -> dict | None:
     """
-    Return dict {outcome, pnl_pct, closed_at} kalau outcome sudah bisa ditentukan,
-    None kalau masih OPEN dan belum expired (tidak perlu update apa pun).
+    Return dict siap dikirim ke supabase_store.update_signal_outcome() kalau outcome
+    sudah bisa ditentukan (baik closed maupun OPEN_EXPIRED), None kalau masih harus
+    ditunggu (belum tersentuh apa pun dan belum expired).
     """
     symbol = row["symbol"]
     direction = row["direction"]
@@ -72,51 +67,44 @@ def _evaluate_signal(row: dict) -> dict | None:
     age_hours = (datetime.now(timezone.utc) - generated_dt).total_seconds() / 3600
 
     try:
-        df = exchange_client.fetch_ohlcv_since_df(symbol, TRACKING_TIMEFRAME, since_ms, limit=1000)
+        df = exchange_client.fetch_ohlcv_since_df(symbol, settings.tf_outcome, since_ms, limit=1000)
     except Exception as e:
         logger.error(f"[{symbol}] Gagal fetch candle untuk tracking outcome: {e}")
         return None
 
-    if df.empty:
+    # Candle PERTAMA dari fetch_ohlcv_since_df(since=generated_at) bisa jadi candle yang
+    # SEDANG BERJALAN saat signal digenerate (bukan sepenuhnya "setelah" entry) - buang
+    # supaya tidak ada risiko look-ahead/self-fulfilling pada candle entry itu sendiri.
+    if not df.empty and df.index[0] <= generated_dt:
+        df = df.iloc[1:]
+
+    result = evaluate_trade_path(
+        df, direction, entry, sl, tp1, tp2, tp3,
+        entry_time=generated_dt,
+        same_bar_policy=settings.outcome_same_bar_policy,
+    )
+    if result is None:
         return None
 
-    tp_targets = [("WIN_TP1", tp1), ("WIN_TP2", tp2), ("WIN_TP3", tp3)]
-    tp_targets = [(label, tp) for label, tp in tp_targets if tp is not None]
-    best_tp_reached = None  # index terjauh di tp_targets yang tercapai
+    if result.still_open:
+        if age_hours < settings.outcome_max_age_hours:
+            return None  # masih open, belum expired - cek lagi nanti
+        outcome = OPEN_EXPIRED
+    else:
+        outcome = result.outcome
 
-    for ts, candle in df.iterrows():
-        low, high = float(candle["low"]), float(candle["high"])
-
-        sl_hit = (low <= sl) if direction == "LONG" else (high >= sl)
-        if sl_hit:
-            return {
-                "outcome": "LOSS_SL",
-                "pnl_pct": round(_pnl_pct(direction, entry, sl), 4),
-                "closed_at": ts.isoformat(),
-            }
-
-        for i, (label, tp) in enumerate(tp_targets):
-            reached = (high >= tp) if direction == "LONG" else (low <= tp)
-            if reached and (best_tp_reached is None or i > best_tp_reached):
-                best_tp_reached = i
-
-    if best_tp_reached is not None:
-        label, tp = tp_targets[best_tp_reached]
-        return {
-            "outcome": label,
-            "pnl_pct": round(_pnl_pct(direction, entry, tp), 4),
-            "closed_at": df.index[-1].isoformat(),
-        }
-
-    if age_hours >= settings.outcome_max_age_hours:
-        last_close = float(df["close"].iloc[-1])
-        return {
-            "outcome": "OPEN_EXPIRED",
-            "pnl_pct": round(_pnl_pct(direction, entry, last_close), 4),
-            "closed_at": df.index[-1].isoformat(),
-        }
-
-    return None  # masih open, belum expired - cek lagi nanti
+    return {
+        "outcome": outcome,
+        "pnl_pct": result.pnl_pct,
+        "closed_at": result.closed_at,
+        "mfe_pct": result.mfe_pct,
+        "mae_pct": result.mae_pct,
+        "time_to_outcome_hours": (
+            round(result.time_to_outcome_seconds / 3600, 4)
+            if result.time_to_outcome_seconds is not None else None
+        ),
+        "ambiguous_same_bar": result.ambiguous_same_bar,
+    }
 
 
 def track_outcomes() -> int:
@@ -136,8 +124,9 @@ def track_outcomes() -> int:
         result = _evaluate_signal(row)
         if result is None:
             continue
-        supabase_store.update_signal_outcome(row["id"], result["outcome"], result["pnl_pct"], result["closed_at"])
-        logger.info(f"[{row['symbol']}] id={row['id']} -> {result['outcome']} ({result['pnl_pct']:+.2f}%)")
+        supabase_store.update_signal_outcome(row["id"], result)
+        flag = " [AMBIGU: SL&TP di candle sama]" if result.get("ambiguous_same_bar") else ""
+        logger.info(f"[{row['symbol']}] id={row['id']} -> {result['outcome']} ({result['pnl_pct']:+.2f}%){flag}")
         updated += 1
 
     logger.info(f"Outcome tracking selesai: {updated}/{len(open_signals)} signal di-update.")

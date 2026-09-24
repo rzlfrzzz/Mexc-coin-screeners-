@@ -137,6 +137,47 @@ class ExchangeClient:
         df.set_index("timestamp", inplace=True)
         return df
 
+    def fetch_ohlcv_range_df(self, symbol: str, timeframe: str, since_ms: int,
+                              until_ms: int = None, page_limit: int = 1000) -> pd.DataFrame:
+        """
+        Sama seperti fetch_ohlcv_since_df, tapi dengan PAGINASI - dipakai backtest.py untuk
+        mengambil data timeframe granular (mis. 15m) mencakup periode yang panjang (mis. 60
+        hari = ~5760 candle 15m), yang biasanya melebihi limit satu request exchange.
+        Berhenti begitu tidak ada candle baru lagi, atau sudah melewati until_ms/waktu sekarang.
+        """
+        until_ms = until_ms if until_ms is not None else int(time.time() * 1000)
+        tf_ms = self.exchange.parse_timeframe(timeframe) * 1000
+        all_rows = []
+        cursor = since_ms
+        seen_ts = set()
+
+        while cursor < until_ms:
+            raw = self._call_with_retry(self.exchange.fetch_ohlcv, symbol, timeframe=timeframe,
+                                         since=cursor, limit=page_limit)
+            if not raw:
+                break
+            new_rows = [r for r in raw if r[0] not in seen_ts]
+            if not new_rows:
+                break
+            all_rows.extend(new_rows)
+            for r in new_rows:
+                seen_ts.add(r[0])
+            last_ts = raw[-1][0]
+            next_cursor = last_ts + tf_ms
+            if next_cursor <= cursor:  # exchange tidak maju, hindari infinite loop
+                break
+            cursor = next_cursor
+            if len(raw) < page_limit:
+                break  # halaman terakhir (exchange mengembalikan lebih sedikit dari limit)
+
+        df = pd.DataFrame(all_rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        if df.empty:
+            return df
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        df.set_index("timestamp", inplace=True)
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+        return df[df.index <= pd.to_datetime(until_ms, unit="ms", utc=True)]
+
     def fetch_ticker(self, symbol: str) -> dict:
         return self._call_with_retry(self.exchange.fetch_ticker, symbol)
 
@@ -249,7 +290,11 @@ class ExchangeClient:
                 "ticker": ticker,
                 "spread_pct": self.fetch_order_book_spread_pct(symbol),
                 "ohlcv_htf": self.fetch_ohlcv_df(symbol, settings.tf_htf, limit=300),
-                "ohlcv_mtf": self.fetch_ohlcv_df(symbol, settings.tf_mtf, limit=300),
+                # ohlcv_structure (default 1h) -> Layer 1/3/4 (ATR, struktur, SMC).
+                # ohlcv_entry     (default 15m)-> Layer 5/6/7/8 (momentum, volume, trigger, entry price).
+                # Lihat config.py untuk kenapa keduanya dipisah (P1 - Pisahkan Timeframe).
+                "ohlcv_structure": self.fetch_ohlcv_df(symbol, settings.tf_structure, limit=300),
+                "ohlcv_entry": self.fetch_ohlcv_df(symbol, settings.tf_entry, limit=300),
                 # None kalau tidak didukung/gagal - masing-masing layer wajib menangani None
                 # secara graceful (skip check), bukan menganggapnya sebagai kegagalan fetch total.
                 "funding_rate_pct": self.fetch_funding_rate_pct(symbol),

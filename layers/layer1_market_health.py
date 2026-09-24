@@ -31,21 +31,22 @@ def run(raw_data: dict) -> LayerResult:
     symbol = raw_data["symbol"]
     ticker = raw_data["ticker"]
     spread_pct = raw_data["spread_pct"]
-    df_mtf = raw_data["ohlcv_mtf"]  # 1H
+    df_structure = raw_data["ohlcv_structure"]  # default 1H (settings.tf_structure)
 
     volume_24h_usd = ticker.get("quoteVolume") or (ticker.get("baseVolume", 0) * (ticker.get("last") or 0))
-    atr_series = atr_pct(df_mtf, period=14)
+    atr_series = atr_pct(df_structure, period=14)
     current_atr_pct = float(atr_series.iloc[-1]) if len(atr_series) else 0.0
 
-    # Volume rolling 24h (24 candle 1H) dari OHLCV yang sudah di-fetch, dipakai untuk
-    # percentile relatif - tidak butuh API call tambahan.
-    rolling_vol_24h = df_mtf["volume"].rolling(window=24).sum()
+    # Volume rolling 24h (24 candle di timeframe structure, asumsi 1H -> 24 candle = 24 jam)
+    # dari OHLCV yang sudah di-fetch, dipakai untuk percentile relatif - tidak butuh API
+    # call tambahan.
+    rolling_vol_24h = df_structure["volume"].rolling(window=24).sum()
     atr_percentile = percentile_of_last(atr_series, min_history=settings.percentile_min_history)
     volume_percentile = percentile_of_last(rolling_vol_24h, min_history=settings.percentile_min_history)
 
-    # pump/dump check: perubahan harga dalam 1 jam terakhir (1 candle 1H)
-    last_close = df_mtf["close"].iloc[-1]
-    prev_close = df_mtf["close"].iloc[-2] if len(df_mtf) >= 2 else last_close
+    # pump/dump check: perubahan harga dalam 1 candle timeframe structure (default 1H)
+    last_close = df_structure["close"].iloc[-1]
+    prev_close = df_structure["close"].iloc[-2] if len(df_structure) >= 2 else last_close
     change_1h_pct = abs((last_close - prev_close) / prev_close * 100) if prev_close else 0.0
 
     funding_rate_pct = raw_data.get("funding_rate_pct")

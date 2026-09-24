@@ -1,7 +1,7 @@
 """
 Layer 4 - Smart Money Area
 ----------------------------
-Mencari 3 area penting pada 1H:
+Mencari 3 area penting pada timeframe structure (default 1H, settings.tf_structure):
 1. Order Block   : candle impulsif terakhir sebelum pergerakan besar berlawanan arah candle itu.
 2. Fair Value Gap: gap 3-candle (high candle[i-1] vs low candle[i+1], atau sebaliknya).
 3. Liquidity Sweep: swing high/low yang disapu (wick menembus) lalu candle close kembali
@@ -123,14 +123,18 @@ def price_in_zone(price: float, zone: SmartMoneyZone, tolerance_pct: float = 0.1
 
 
 def run(raw_data: dict, direction: Direction) -> LayerResult:
-    df_mtf = raw_data["ohlcv_mtf"]
-    current_price = float(df_mtf["close"].iloc[-1])
+    # Zona (OB/FVG/liquidity sweep) tetap dihitung dari timeframe structure (default 1H) -
+    # ini area besar yang tidak berubah tiap 15 menit. Tapi "harga sekarang" untuk cek
+    # apakah harga SEDANG BERADA di zona itu pakai timeframe entry (default 15m, lebih
+    # fresh) - candle structure terakhir bisa sampai ~1 jam ketinggalan dari harga riil.
+    df_structure = raw_data["ohlcv_structure"]
+    current_price = float(raw_data["ohlcv_entry"]["close"].iloc[-1])
 
     swing_lookback = raw_data.get("swing_lookback")
 
-    order_blocks = find_order_blocks(df_mtf, direction)
-    fvgs = find_fvgs(df_mtf, direction)
-    sweep = find_liquidity_sweep(df_mtf, direction, lookback=swing_lookback)
+    order_blocks = find_order_blocks(df_structure, direction)
+    fvgs = find_fvgs(df_structure, direction)
+    sweep = find_liquidity_sweep(df_structure, direction, lookback=swing_lookback)
 
     ob_in_range = [ob for ob in order_blocks if price_in_zone(current_price, ob)]
     fvg_in_range = [f for f in fvgs if price_in_zone(current_price, f)]

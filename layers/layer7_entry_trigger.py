@@ -1,8 +1,11 @@
 """
 Layer 7 - Entry Trigger
 -------------------------
-Entry hanya dikirim ketika semua layer sebelumnya (1-6) lolos DAN ada
-pattern konfirmasi candlestick pada candle terakhir 1H:
+Entry hanya dikirim ketika semua layer sebelumnya (1-6) lolos DAN ada pattern konfirmasi
+candlestick pada candle terakhir timeframe ENTRY (default 15m, settings.tf_entry) - bukan
+timeframe structure - karena trigger entry aktual harus setepat mungkin, tidak menunggu
+candle 1H/4H selesai (lihat ringkasan_perbaikan.md P1.8, "15M Trigger" di paling bawah
+hierarki HTF Bias -> Structure -> Liquidity -> SMC Location -> 15M Trigger):
 - Bullish/Bearish Engulfing, atau
 - Close menembus level resistance/support terdekat (breakout confirmation)
 """
@@ -41,20 +44,20 @@ def _closed_beyond_recent_extreme(df, direction: Direction, window: int = 20) ->
 
 
 def run(raw_data: dict, direction: Direction, prior_layers_passed: bool) -> LayerResult:
-    df_mtf = raw_data["ohlcv_mtf"]
+    df_entry = raw_data["ohlcv_entry"]
 
     if not prior_layers_passed:
         return LayerResult(7, "Entry Trigger", LayerStatus.FAIL,
                             "Salah satu layer sebelumnya gagal, entry trigger tidak dievaluasi", {})
 
     if direction == Direction.LONG:
-        pattern = _is_bullish_engulfing(df_mtf)
+        pattern = _is_bullish_engulfing(df_entry)
         pattern_name = "Bullish Engulfing"
     else:
-        pattern = _is_bearish_engulfing(df_mtf)
+        pattern = _is_bearish_engulfing(df_entry)
         pattern_name = "Bearish Engulfing"
 
-    breakout_confirm = _closed_beyond_recent_extreme(df_mtf, direction)
+    breakout_confirm = _closed_beyond_recent_extreme(df_entry, direction)
 
     data = {
         "pattern_detected": pattern,

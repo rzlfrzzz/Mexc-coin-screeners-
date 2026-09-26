@@ -63,6 +63,7 @@ from config import settings
 from models import Direction, LayerStatus
 from core.exchange_client import exchange_client
 from trade_outcome import evaluate_trade_path, OPEN_EXPIRED
+from setup_identity import build_setup_id
 from layers import (
     layer1_market_health, layer2_trend, layer3_structure,
     layer4_smart_money, layer5_momentum, layer6_volume,
@@ -133,6 +134,7 @@ class BacktestRecord:
     mfe_pct: float
     mae_pct: float
     ambiguous_same_bar: bool
+    setup_id: str = None
     soft_fail_layers: list = field(default_factory=list)
 
 
@@ -224,14 +226,19 @@ def simulate_symbol(symbol: str, df_htf_full: pd.DataFrame, df_structure_full: p
             i += 1
             continue
 
-        atr_pct_1h = lr1.data.get("atr_pct_1h", 0.0)
         snapshot = {
-            "atr_high": atr_pct_1h > (settings.min_atr_pct * 1.5),
-            "not_near_resistance": True,  # disederhanakan untuk backtest
+            # Layer 0 (BTC regime) di backtest tidak dijalankan sebagai LayerResult (lihat
+            # _check_btc_regime() helper) - jadi Layer 9 V2 fallback ke flag biner ini untuk
+            # kategori "regime_4h" (lihat layers/layer9_scoring.py::_score_regime_4h).
             "btc_regime_aligned": bool(btc_direction == direction.value and btc_direction != Direction.NONE.value),
             "oi_confirmation": False,  # data OI historis tidak disimulasikan
         }
-        layer_by_number = {1: lr1, 2: lr2, 3: lr3, 4: lr4, 5: lr5, 6: lr6}
+        # Layer 7 & 8 (entry trigger, risk management) DIIKUTKAN ke layer_by_number - Phase 7
+        # rebalance memakai data mentahnya (displacement_strength, tp1_rr, sl_source) untuk
+        # kategori "entry_trigger_15m" & "risk_quality". Sebelumnya keduanya dihitung di atas
+        # (lr7, lr8) tapi TIDAK diikutkan ke sini - scoring lama tidak memakainya sama sekali,
+        # skema baru butuh keduanya supaya paritas persis dengan live pipeline.py.
+        layer_by_number = {1: lr1, 2: lr2, 3: lr3, 4: lr4, 5: lr5, 6: lr6, 7: lr7, 8: lr8}
         score = layer9_scoring.run(layer_by_number, snapshot)
 
         if score.total < settings.score_min_to_send:
@@ -260,7 +267,9 @@ def simulate_symbol(symbol: str, df_htf_full: pd.DataFrame, df_structure_full: p
             tp1=risk_plan.tp1, tp2=risk_plan.tp2, tp3=risk_plan.tp3,
             outcome=outcome_label, pnl_pct=outcome_result.pnl_pct, hours_held=hours_held,
             mfe_pct=outcome_result.mfe_pct, mae_pct=outcome_result.mae_pct,
-            ambiguous_same_bar=outcome_result.ambiguous_same_bar, soft_fail_layers=soft_fail,
+            ambiguous_same_bar=outcome_result.ambiguous_same_bar,
+            setup_id=build_setup_id(symbol, direction, lr3.data, lr4.data),
+            soft_fail_layers=soft_fail,
         ))
 
         # satu posisi per symbol pada satu waktu - loncat ke bar mtf pertama SETELAH

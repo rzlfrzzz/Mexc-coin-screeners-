@@ -45,8 +45,13 @@ class SmartMoneyZone:
     direction: Direction
     top: float
     bottom: float
-    index: int               # index candle tempat zona terbentuk
+    index: int               # index candle tempat zona terbentuk (posisi RELATIF di slice
+                              # yang dipakai detector - JANGAN dipakai untuk id stabil lintas
+                              # scan, pakai `formed_at` + zone_id lewat setup_identity.py)
     valid: bool = True
+    formed_at: str | None = None  # timestamp ISO ABSOLUT candle pembentuk zona - stabil
+                                   # lintas scan (dipakai untuk membangun zone_id, lihat
+                                   # layers/layer4_smart_money.py::make_zone_id())
     meta: dict = field(default_factory=dict)
 
 
@@ -84,14 +89,34 @@ class TradeSignal:
     sent: bool = False
     fail_layer: Optional[str] = None  # diisi jika pipeline berhenti (hard-stop) di tengah jalan
     soft_fail_layers: list = field(default_factory=list)  # layer 4-6 yang FAIL tapi tidak hard-stop
+    setup_id: Optional[str] = None  # identitas unik setup (symbol+direction+structure_event+zone) -
+                                     # lihat setup_identity.py. Dipakai untuk anti-duplikasi & analitik.
+    correlation_meta: dict = field(default_factory=dict)  # lihat core/correlation_tracker.py (Phase 7)
 
     def to_supabase_row(self) -> dict:
+        # Score breakdown (Phase 7 - lihat layers/layer9_scoring.py) DIRATAKAN jadi kolom
+        # top-level score_* di sini (bukan cuma terkubur di dalam layer_results[9].data),
+        # supaya bisa langsung di-query untuk analisis tanpa unwrap JSON, sesuai contoh
+        # pertanyaan di ringkasan_perbaikan.md P2: "signal dengan liquidity sweep + FVG + OI
+        # naik sebenarnya performanya bagaimana?".
+        breakdown = self.score.breakdown if self.score else {}
+
         return {
             "symbol": self.symbol,
             "direction": self.direction.value,
             "generated_at": self.generated_at,
+            "setup_id": self.setup_id,
             "score": self.score.total if self.score else None,
             "grade": self.score.grade if self.score else None,
+            "score_regime_4h": breakdown.get("regime_4h"),
+            "score_structure_1h": breakdown.get("structure_1h"),
+            "score_liquidity_event": breakdown.get("liquidity_event"),
+            "score_smc_location": breakdown.get("smc_location"),
+            "score_entry_trigger_15m": breakdown.get("entry_trigger_15m"),
+            "score_volume": breakdown.get("volume"),
+            "score_momentum": breakdown.get("momentum"),
+            "score_oi": breakdown.get("oi"),
+            "score_risk_quality": breakdown.get("risk_quality"),
             "entry": self.risk_plan.entry if self.risk_plan else None,
             "sl": self.risk_plan.sl if self.risk_plan else None,
             "tp1": self.risk_plan.tp1 if self.risk_plan else None,
@@ -105,6 +130,10 @@ class TradeSignal:
             "sent": self.sent,
             "fail_layer": self.fail_layer,
             "soft_fail_layers": self.soft_fail_layers,
+            # Correlation awareness (Phase 7, lihat core/correlation_tracker.py) - metadata,
+            # TIDAK mempengaruhi score di atas.
+            "correlation_same_direction_count": self.correlation_meta.get("same_direction_signals_this_scan"),
+            "correlation_high_risk": self.correlation_meta.get("high_correlation_risk", False),
             # outcome & backtest fields diisi belakangan oleh proses tracking terpisah
             "outcome": None,
             "closed_at": None,

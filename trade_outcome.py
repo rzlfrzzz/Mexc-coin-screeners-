@@ -179,4 +179,4 @@ def evaluate_trade_path(
         mae_pct=round(mae_pct, 4),
         ambiguous_same_bar=False,
         still_open=True,
-)
+    )

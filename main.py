@@ -13,9 +13,13 @@ import time
 from loguru import logger
 from apscheduler.schedulers.blocking import BlockingScheduler
 
+from datetime import datetime, timezone
+
 from config import settings, validate_settings
 from pipeline import scan_watchlist
 from core.watchlist import watchlist_manager
+from core.metrics import scan_metrics
+from core.supabase_client import supabase_store
 from outcome_tracker import track_outcomes
 
 
@@ -33,6 +37,19 @@ def job():
     elapsed = time.time() - start
     symbols = watchlist_manager.current_symbols()
     logger.info(f"=== Scan selesai dalam {elapsed:.1f}s untuk {symbols}, {len(signals)} signal terkirim ===")
+
+    # Simpan metrics siklus scan ini (Phase 8 - lihat core/metrics.py & ringkasan_perbaikan.md
+    # P2) supaya histori scan_duration_ms/request_count/failed_requests/retry_count bisa
+    # dianalisis dari waktu ke waktu, bukan cuma dilihat sekali di log lalu hilang - berguna
+    # untuk membandingkan watchlist_top_n 100 vs 150 vs 200 secara historis di produksi,
+    # melengkapi watchlist_stress_test.py yang mengujinya secara terkontrol.
+    metrics_row = {
+        "scanned_at": datetime.now(timezone.utc).isoformat(),
+        "watchlist_size": len(symbols),
+        "watchlist_mode": settings.watchlist_mode,
+        **scan_metrics.as_dict(),
+    }
+    supabase_store.save_scan_metrics(metrics_row)
 
 
 def outcome_tracking_job():

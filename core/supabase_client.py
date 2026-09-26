@@ -87,16 +87,25 @@ class SupabaseStore:
         except Exception as e:
             logger.error(f"Gagal menyimpan layer log ke Supabase: {e}")
 
-    def update_signal_outcome(self, signal_id, outcome: str, pnl_pct: float, closed_at: str) -> None:
-        """Dipanggil oleh proses tracking terpisah (mis. cron) setelah TP/SL tersentuh."""
+    def update_signal_outcome(self, signal_id, result: dict) -> None:
+        """
+        Dipanggil oleh outcome_tracker.py / backtest.py (lewat trade_outcome.evaluate_trade_path)
+        setelah outcome bisa ditentukan. `result` minimal berisi: outcome, pnl_pct, closed_at.
+        Field opsional (mfe_pct, mae_pct, time_to_outcome_hours, ambiguous_same_bar) diikutkan
+        kalau ada - kolomnya ditambahkan lewat migrasi di supabase_schema.sql.
+        """
         if not self.client:
             return
+        payload = {
+            "outcome": result["outcome"],
+            "pnl_pct": result["pnl_pct"],
+            "closed_at": result["closed_at"],
+        }
+        for optional_key in ("mfe_pct", "mae_pct", "time_to_outcome_hours", "ambiguous_same_bar"):
+            if optional_key in result and result[optional_key] is not None:
+                payload[optional_key] = result[optional_key]
         try:
-            self.client.table(settings.supabase_signals_table).update({
-                "outcome": outcome,
-                "pnl_pct": pnl_pct,
-                "closed_at": closed_at,
-            }).eq("id", signal_id).execute()
+            self.client.table(settings.supabase_signals_table).update(_json_safe(payload)).eq("id", signal_id).execute()
         except Exception as e:
             logger.error(f"Gagal update outcome signal {signal_id}: {e}")
 
@@ -140,6 +149,82 @@ class SupabaseStore:
         except Exception as e:
             logger.error(f"Gagal cek open signal untuk {symbol}: {e}")
             return False  # fail-open: kalau cek gagal, jangan blokir pengiriman signal
+
+    def get_open_signal_setup_id(self, symbol: str) -> str | None:
+        """
+        Ambil `setup_id` dari open signal (kalau ada) untuk symbol ini - dipakai
+        process_and_dispatch() untuk membedakan dua kasus saat symbol masih punya
+        posisi open (lihat has_open_signal()):
+        1. setup_id BARU == setup_id yang sedang open -> murni repeat scan, setup yang
+           sama belum invalid/consumed (kasus NORMAL, memang harus di-skip diam-diam).
+        2. setup_id BARU != setup_id yang sedang open -> setup yang BERBEDA muncul
+           (BOS/zona baru) sementara posisi lama masih open - tetap di-skip (bot ini
+           satu posisi per symbol), TAPI ini informasi berharga untuk log/analisis,
+           bukan sekadar "signal duplikat biasa".
+        Return None kalau tidak ada open signal, Supabase tidak terkoneksi, atau baris
+        lama belum punya kolom setup_id (data sebelum migrasi Phase 5).
+        """
+        if not self.client:
+            return None
+        try:
+            res = (
+                self.client.table(settings.supabase_signals_table)
+                .select("setup_id")
+                .eq("symbol", symbol)
+                .eq("sent", True)
+                .is_("outcome", "null")
+                .order("generated_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            return res.data[0].get("setup_id") if res.data else None
+        except Exception as e:
+            logger.error(f"Gagal ambil setup_id open signal untuk {symbol}: {e}")
+            return None
+
+    def save_scan_metrics(self, metrics_row: dict) -> None:
+        """
+        Simpan metrics satu siklus scan (Phase 8 - lihat core/metrics.py &
+        ringkasan_perbaikan.md P2) ke tabel terpisah `scan_metrics` - BUKAN tabel signals,
+        supaya histori metrics tetap ada walau siklus scan itu tidak menghasilkan sinyal
+        sama sekali. Dipakai untuk menjawab "apakah bottleneck watchlist 150/200 symbol
+        berasal dari API (request_count/retry_count/failed_requests naik) atau dari
+        computation (scan_duration_ms naik tapi request tetap wajar)?" secara historis,
+        bukan cuma sekali lihat waktu itu saja.
+        """
+        if not self.client:
+            return
+        try:
+            self.client.table("scan_metrics").insert(_json_safe(metrics_row)).execute()
+        except Exception as e:
+            logger.error(f"Gagal menyimpan scan metrics ke Supabase: {e}")
+
+    def fetch_closed_signals(self, limit: int = 2000) -> list:
+        """
+        Ambil signal yang SUDAH punya outcome (outcome IS NOT NULL, dan bukan
+        SKIPPED_DUPLICATE) - dipakai untuk analisis post-hoc parameter yang TIDAK bisa
+        divalidasi lewat backtest.py karena datanya tidak disimulasikan secara historis
+        (funding_rate_pct, oi_change_pct - lihat backtest.py docstring & optimize.py /
+        analyze_live_params.py Phase 8). Analisis ini baru bermakna setelah data live
+        terkumpul cukup banyak (lihat ringkasan_perbaikan.md P3: "kita kumpulkan data dulu").
+        """
+        if not self.client:
+            logger.warning("Supabase tidak terkoneksi, tidak bisa ambil closed signals.")
+            return []
+        try:
+            res = (
+                self.client.table(settings.supabase_signals_table)
+                .select("*")
+                .not_.is_("outcome", "null")
+                .neq("outcome", "SKIPPED_DUPLICATE")
+                .order("generated_at", desc=False)
+                .limit(limit)
+                .execute()
+            )
+            return res.data or []
+        except Exception as e:
+            logger.error(f"Gagal ambil closed signals dari Supabase: {e}")
+            return []
 
     def fetch_open_signals(self, limit: int = 200) -> list:
         """

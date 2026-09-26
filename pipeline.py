@@ -27,6 +27,9 @@ from core.exchange_client import exchange_client
 from core.watchlist import watchlist_manager
 from core.supabase_client import supabase_store
 from core.telegram_notifier import send_signal
+from core.correlation_tracker import correlation_tracker
+from core.metrics import scan_metrics
+from setup_identity import build_setup_id
 
 from layers import (
     layer0_btc_regime,
@@ -122,6 +125,13 @@ def run_pipeline_for_symbol(symbol: str) -> TradeSignal | None:
     _record_soft(lr4)
     signal.smart_money_zones = smc_zones
 
+    # ---------------- Setup ID (lihat setup_identity.py & ringkasan_perbaikan.md P2) ----------------
+    # Identitas unik setup ini = symbol + direction + structure event (BOS/CHoCH dari Layer 3)
+    # + zona aktif (OB/FVG dari Layer 4). Dihitung di sini (setelah Layer 3 & 4 tersedia)
+    # supaya bisa dipakai untuk anti-duplikasi yang lebih presisi di process_and_dispatch()
+    # - bukan cuma "symbol ini ada open trade" tapi "setup PERSIS INI sudah pernah dikirim".
+    signal.setup_id = build_setup_id(symbol, direction, lr3.data, lr4.data)
+
     # ---------------- Layer 5 (SOFT - scoring, tidak hard-stop) ----------------
     lr5 = layer5_momentum.run(raw_data, direction)
     _record_soft(lr5)
@@ -175,11 +185,21 @@ def run_pipeline_for_symbol(symbol: str) -> TradeSignal | None:
         and lr0.data.get("btc_direction") != Direction.NONE.value
     )
 
-    # OI confirmation: kenaikan Open Interest signifikan dianggap indikasi posisi baru
-    # benar-benar dibangun (bukan cuma short-covering/long-unwind) -> breakout lebih valid.
-    oi_change_pct = raw_data.get("oi_change_pct")
+    # OI: price x OI directional model (lihat indicators.technical.classify_price_oi_direction
+    # & core/exchange_client.py::fetch_oi_price_model) - BUKAN lagi "OI naik = bullish" naif.
+    # oi_confirmation sekarang berarti "OI bergerak searah trade DAN merupakan buildup posisi
+    # baru (LONG_BUILDUP/SHORT_BUILDUP) ATAU minimal unwind yang tidak berlawanan
+    # (SHORT_COVERING utk LONG, LONG_LIQUIDATION utk SHORT)" - lihat layer9_scoring.py::_score_oi
+    # untuk gradasi penuh/partial-nya di skor.
+    oi_model = raw_data.get("oi_price_model")
+    oi_direction = oi_model.get("classification") if oi_model else None
+    oi_change_pct = oi_model.get("oi_change_pct") if oi_model else None
+    oi_price_change_pct = oi_model.get("price_change_pct") if oi_model else None
     oi_confirmation = bool(
-        oi_change_pct is not None and oi_change_pct > settings.oi_confirmation_min_change_pct
+        oi_direction is not None and (
+            (direction == Direction.LONG and oi_direction in ("LONG_BUILDUP", "SHORT_COVERING"))
+            or (direction == Direction.SHORT and oi_direction in ("SHORT_BUILDUP", "LONG_LIQUIDATION"))
+        )
     )
 
     snapshot = {
@@ -198,7 +218,9 @@ def run_pipeline_for_symbol(symbol: str) -> TradeSignal | None:
         "btc_regime_aligned": btc_regime_aligned,
         "btc_direction": lr0.data.get("btc_direction"),
         "oi_confirmation": oi_confirmation,
+        "oi_direction": oi_direction,
         "oi_change_pct": oi_change_pct,
+        "oi_price_change_pct": oi_price_change_pct,
         "funding_rate_pct": lr1.data.get("funding_rate_pct"),
         "swing_lookback": lr3.data.get("swing_lookback"),
     }
@@ -224,6 +246,18 @@ def run_pipeline_for_symbol(symbol: str) -> TradeSignal | None:
         supabase_store.save_signal(signal.to_supabase_row())
         return None
 
+    # ---------------- Correlation awareness (Phase 7, lihat core/correlation_tracker.py) ----
+    # Didaftarkan di sini (bukan di process_and_dispatch) supaya SETIAP sinyal yang lolos
+    # score_min_to_send ikut terhitung sebagai "qualifying signal searah" di scan ini - baik
+    # yang nanti benar2 terkirim maupun yang di-skip karena duplikasi open-trade (skip
+    # duplikasi tetap merepresentasikan "kondisi teknikal ini muncul lagi", bukan noise acak).
+    signal.correlation_meta = correlation_tracker.register_and_check(symbol, direction.value)
+    if signal.correlation_meta.get("high_correlation_risk"):
+        others = ", ".join(signal.correlation_meta["same_direction_symbols_this_scan"])
+        logger.info(f"[{symbol}] Correlation awareness: {signal.correlation_meta['same_direction_signals_this_scan']} "
+                    f"sinyal {direction.value} lain sudah lolos di scan ini ({others}) - kemungkinan "
+                    f"BTC-beta/market-wide move, bukan edge independen per-coin.")
+
     return signal
 
 
@@ -245,9 +279,15 @@ def process_and_dispatch(symbol: str) -> TradeSignal | None:
     # belum berubah, sehingga terkirim berkali-kali (duplikasi) untuk trade yang sebenarnya
     # masih berjalan.
     if supabase_store.has_open_signal(symbol):
-        logger.info(
-            f"[{symbol}] Skip kirim: masih ada trade open (belum SL/TP/expired) untuk symbol ini."
-        )
+        existing_setup_id = supabase_store.get_open_signal_setup_id(symbol)
+        if existing_setup_id and existing_setup_id == signal.setup_id:
+            logger.info(f"[{symbol}] Skip kirim: setup PERSIS SAMA ({signal.setup_id}) masih open, belum invalid/consumed.")
+        else:
+            logger.info(
+                f"[{symbol}] Skip kirim: setup BARU terdeteksi ({signal.setup_id}) tapi masih ada "
+                f"posisi open lain ({existing_setup_id or 'setup_id lama tidak tercatat'}) - bot ini "
+                "satu posisi per symbol, setup baru ini diabaikan sampai posisi lama closed."
+            )
         signal.sent = False
         skip_row = signal.to_supabase_row()
         skip_row["outcome"] = "SKIPPED_DUPLICATE"
@@ -265,13 +305,29 @@ def process_and_dispatch(symbol: str) -> TradeSignal | None:
 
 
 def scan_watchlist() -> list:
-    """Scan seluruh watchlist saat ini (static atau dynamic), kembalikan list signal yang berhasil dikirim."""
+    """Scan seluruh watchlist saat ini (static atau dynamic), kembalikan list signal yang berhasil dikirim.
+
+    Metrics siklus scan ini (scan_duration_ms, request_count, failed_requests, retry_count,
+    symbols_processed, signals_generated - lihat ringkasan_perbaikan.md P2 & core/metrics.py)
+    tersedia lewat core.metrics.scan_metrics SEGERA setelah fungsi ini return - dibaca oleh
+    main.py (log + simpan ke Supabase) dan watchlist_stress_test.py (Phase 8, uji ukuran
+    watchlist 100/150/200)."""
     exchange_client.load_markets()
+    # Reset correlation tracker & scan metrics di awal SETIAP siklus scan (bukan persisten
+    # antar siklus) - lihat core/correlation_tracker.py: metadata korelasi ini hanya relevan
+    # untuk "berapa sinyal searah lain muncul BERSAMAAN di scan yang sama", bukan histori
+    # lintas waktu. Sama halnya untuk scan_metrics: per-siklus, bukan kumulatif selamanya.
+    correlation_tracker.reset()
+    scan_metrics.reset()
     symbols = watchlist_manager.get_symbols()
     sent_signals = []
     for symbol in symbols:
         logger.info(f"Scanning {symbol} ...")
+        scan_metrics.record_symbol_processed()
         signal = process_and_dispatch(symbol)
         if signal:
             sent_signals.append(signal)
+            scan_metrics.record_signal_generated()
+    scan_metrics.stop()
+    logger.info(f"Scan metrics: {scan_metrics.as_dict()}")
     return sent_signals

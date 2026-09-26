@@ -88,7 +88,13 @@ class Settings:
     # tf_structure (timeframe sinyal), supaya urutan kejadian SL-vs-TP di dalam satu candle
     # sinyal bisa dibedakan (lihat ringkasan_perbaikan.md P0: "Signal = 15M, Outcome
     # checking = 1M/5M", di sini digeneralisasi relatif terhadap tf_structure).
-    tf_outcome: str = os.getenv("TF_OUTCOME", "15m")
+    # Default DIUBAH ke 5m (sebelumnya 15m = sama dengan tf_entry, jadi tidak benar2
+    # granular - lihat instruksi perbaikan "Ubah TF_OUTCOME ke 5M supaya mengurangi ambiguity
+    # TP vs SL"). Dengan 5m, urutan SL-vs-TP di dalam satu candle sinyal (1H) ATAU di dalam
+    # satu candle entry (15M) bisa dibedakan lebih presisi - candle 15M yang menyentuh SL & TP
+    # sekaligus dulunya tetap ambigu (evaluate_trade_path butuh candle LEBIH KECIL dari
+    # candle sinyal DAN dari candle entry, bukan cuma lebih kecil dari salah satunya).
+    tf_outcome: str = os.getenv("TF_OUTCOME", "5m")
     # Kalau SL & TP tersentuh di CANDLE tf_outcome YANG SAMA (masih ambigu walau sudah
     # granular), urutan mana yang diasumsikan menang:
     # "conservative_sl_first" (default, tidak melebih-lebihkan win rate) atau
@@ -176,6 +182,68 @@ class Settings:
     swing_lookback_low_atr_pct: float = _get_float("SWING_LOOKBACK_LOW_ATR_PCT", 0.5)
     swing_lookback_high_atr_pct: float = _get_float("SWING_LOOKBACK_HIGH_ATR_PCT", 1.5)
 
+    # ---------- Layer 4 - Smart Money (SMC lifecycle) ----------
+    # Lihat ringkasan_perbaikan.md P1.5 - FVG/OB/Liquidity Sweep sekarang punya STATE,
+    # bukan cuma "ketemu atau tidak".
+
+    # FVG dianggap EXPIRED (tidak lagi dipakai sebagai sinyal) kalau sudah berumur lebih
+    # dari sekian candle timeframe structure sejak terbentuk tanpa pernah tersentuh sama
+    # sekali secara berarti (masih FRESH) - gap yang terlalu lama biasanya sudah tidak
+    # relevan lagi secara psikologis pasar.
+    fvg_max_age_bars: int = _get_int("FVG_MAX_AGE_BARS", 60)
+    # FVG dianggap MITIGATED begitu candle manapun sejak terbentuk sudah menembus zona
+    # sejauh >= persentase ini (0-1) dari tinggi gap - bukan cuma "wick nyentuh sedikit".
+    fvg_mitigation_fill_ratio: float = _get_float("FVG_MITIGATION_FILL_RATIO", 0.5)
+
+    # Order Block hanya dianggap valid ("confirmed") kalau benar2 diikuti displacement yang
+    # cukup kuat (net move beberapa candle setelah OB >= sekian x ATR saat itu) DAN diikuti
+    # BOS searah dalam jumlah candle tertentu - bukan cuma "body candle besar = OB"
+    # (lihat P1.5: "OB candle -> displacement -> BOS", bukan "big candle = OB").
+    ob_displacement_min_atr_mult: float = _get_float("OB_DISPLACEMENT_MIN_ATR_MULT", 1.2)
+    ob_displacement_lookforward_bars: int = _get_int("OB_DISPLACEMENT_LOOKFORWARD_BARS", 3)
+    ob_bos_confirm_max_bars: int = _get_int("OB_BOS_CONFIRM_MAX_BARS", 30)
+
+    # Toleransi (dalam % harga) untuk menganggap dua swing high/low sebagai "equal
+    # high/low" - liquidity pool yang lebih kuat daripada satu swing tunggal, karena
+    # ada 2+ level stop yang menumpuk di harga yang hampir sama.
+    equal_level_tolerance_pct: float = _get_float("EQUAL_LEVEL_TOLERANCE_PCT", 0.15)
+
+    # ---------- Layer 7 - Entry Trigger: displacement (lihat ringkasan_perbaikan.md P1.8) ----------
+    # Trigger (engulfing/breakout) HARUS didukung displacement nyata di timeframe entry,
+    # bukan cuma pola candle formasi tanpa tenaga di belakangnya - skema "15M displacement
+    # -> 15M close confirmation -> ENTRY", bukan cuma salah satu.
+    entry_displacement_min_atr_mult: float = _get_float("ENTRY_DISPLACEMENT_MIN_ATR_MULT", 0.8)
+    entry_displacement_lookback_bars: int = _get_int("ENTRY_DISPLACEMENT_LOOKBACK_BARS", 3)
+
+    # ---------- Layer 7 - Entry Trigger: context-awareness (perbaikan) ----------
+    # Trigger 15M (displacement + engulfing/breakout di atas) TIDAK LAGI cukup berdiri
+    # sendiri - HARUS punya hubungan nyata dengan area SMC 1H (Order Block/FVG/Liquidity
+    # Sweep dari Layer 4), supaya "context-aware": trigger yang kebetulan lolos displacement
+    # & pattern candle di 15M tapi terjadi di tengah ruang kosong (bukan reaksi dari OB/FVG
+    # atau lanjutan liquidity sweep 1H) tidak lagi dianggap valid.
+    # `trigger_context_lookback_bars` = jumlah candle ENTRY (15M) tepat SEBELUM window
+    # displacement (lihat entry_displacement_lookback_bars) yang dicek APAKAH range harganya
+    # (wick, bukan cuma close) bersinggungan dengan OB/FVG valid searah - window "pendekatan"
+    # sebelum harga displacement menjauh dari zona itu.
+    trigger_context_lookback_bars: int = _get_int("TRIGGER_CONTEXT_LOOKBACK_BARS", 6)
+    # Untuk konteks liquidity sweep (bukan OB/FVG): sweep 1H dianggap masih "relevan" sebagai
+    # alasan trigger 15M ini kalau umurnya (dalam jumlah candle STRUCTURE/1H sejak sweep
+    # terbentuk sampai candle structure terakhir) tidak lebih dari ini - sweep yang sudah
+    # terlalu lama tidak lagi dianggap penyebab pergerakan 15M sekarang.
+    trigger_context_sweep_max_age_bars: int = _get_int("TRIGGER_CONTEXT_SWEEP_MAX_AGE_BARS", 12)
+
+    # ---------- Layer 8 - Risk Management V2 (lihat ringkasan_perbaikan.md P1.9/P1.10) ----------
+    # SL = level invalidasi struktural (liquidity sweep low/high, atau swing structure
+    # terakhir dari Layer 3 kalau tidak ada sweep aktif) ± buffer dalam satuan ATR -
+    # bukan lagi persentase tetap kecil, supaya buffer otomatis menyesuaikan volatilitas
+    # coin (coin volatile butuh buffer lebih lebar dari wick noise-nya sendiri).
+    sl_atr_buffer_mult: float = _get_float("SL_ATR_BUFFER_MULT", 0.15)  # disarankan 0.1-0.25
+    # TP1 = target struktural terdekat (swing berlawanan arah terdekat) kalau ada & RR-nya
+    # cukup; TP1 ditolak (setup gagal) kalau target struktural itu ADA tapi RR-nya di bawah
+    # minimum ini (resistance/support terlalu dekat untuk ditradingkan secara masuk akal).
+    # Kalau TIDAK ada target struktural terlihat, fallback ke baseline RR 1:1/1:2/1:3.
+    min_rr: float = _get_float("MIN_RR", 1.5)
+
     # Layer 8 - Risk Management sanity check.
     # Batas atas jarak SL dari entry (dalam % dari harga entry). Kalau swing
     # reference yang ditemukan terlalu jauh dari harga sekarang (misal karena
@@ -184,29 +252,71 @@ class Settings:
     # dengan risk > max_risk_pct dari entry akan di-FAIL, bukan diteruskan.
     max_risk_pct: float = _get_float("MAX_RISK_PCT", 20.0)
 
-    # Layer 6b - Open Interest confirmation (soft/scoring, bukan hard block - data OI
-    # via ccxt/MEXC tidak selalu tersedia/stabil, jadi tidak dijadikan syarat wajib)
+    # Layer 6b - Open Interest: price x OI directional model (soft/scoring, bukan hard
+    # block - data OI via ccxt/MEXC tidak selalu tersedia/stabil, jadi tidak dijadikan syarat
+    # wajib). Diperbaiki dari skema lama ("OI naik = bullish" tanpa peduli arah harga) jadi
+    # matrix price x OI standar (lihat indicators.technical.classify_price_oi_direction):
+    #   price naik + OI naik   -> LONG_BUILDUP     (posisi long baru, breakout genuine)
+    #   price turun + OI naik  -> SHORT_BUILDUP    (posisi short baru, breakdown genuine)
+    #   price naik + OI turun  -> SHORT_COVERING   (short tutup posisi, bukan minat beli baru)
+    #   price turun + OI turun -> LONG_LIQUIDATION (long dipaksa keluar, bukan tekanan jual baru)
+    # Kedua threshold di bawah ini HARUS terlewati (bukan cuma salah satu) sebelum pergerakan
+    # price/OI dianggap cukup berarti untuk diklasifikasi - di bawah itu dianggap NEUTRAL/noise.
     oi_confirmation_min_change_pct: float = _get_float("OI_CONFIRMATION_MIN_CHANGE_PCT", 2.0)
+    oi_price_min_change_pct: float = _get_float("OI_PRICE_MIN_CHANGE_PCT", 0.15)
 
     # Layer 9
     score_min_to_send: int = _get_int("SCORE_MIN_TO_SEND", 70)
 
-    # Scoring weights - bisa diubah user tanpa mengubah source code layer lain.
-    # Total tetap 100. Ditambah 2 komponen baru (btc_regime_aligned, oi_confirmation),
-    # trend_aligned & bos sedikit dikurangi supaya total tetap 100.
+    # ---------- Layer 9 - Scoring V2 (lihat ringkasan_perbaikan.md P1.11 / Phase 7) ----------
+    # REBALANCE (Phase 7): skema lama memberi bobot besar ke "trend_aligned" (20) dan "bos" (15)
+    # padahal Layer 2 (trend) & Layer 3 (structure) adalah HARD GATE di pipeline.py - begitu
+    # pipeline sampai ke Layer 9, kedua status itu SUDAH PASTI PASS, jadi bobot itu jadi bonus
+    # tetap yang tidak pernah membedakan sinyal satu sama lain (dead weight). Skema baru
+    # mengikuti tabel confluence score persis di ringkasan_perbaikan.md P1.11:
+    #   4H regime            10
+    #   1H structure         15
+    #   Liquidity event      15   <- BARU: sebelumnya liquidity sweep (Layer 4) terdeteksi &
+    #                                dipakai Layer 8 (SL) tapi TIDAK PERNAH ikut skor sama sekali
+    #   SMC location         15
+    #   15M trigger          15
+    #   Volume               10
+    #   Momentum              5
+    #   OI                    5
+    #   Risk quality         10   <- BARU: kualitas RR & sumber SL (structural vs fallback)
+    #   ------------------------
+    #   TOTAL                100
+    # "atr_high" & "not_near_resistance" (skema lama) DIHAPUS dari skor - sesuai instruksi
+    # eksplisit P1.11 ("aku sengaja mengurangi ketergantungan pada RSI/MACD/ATR"), dan karena
+    # "not_near_resistance" pada dasarnya sudah redundan dengan validasi MIN_RR di Layer 8
+    # (RR minimum sudah menolak setup yang resistance-nya terlalu dekat, tidak perlu skor
+    # tambahan untuk hal yang sama). Setiap kategori sekarang digradasi (bukan cuma 0/penuh)
+    # berdasarkan data mentah yang sudah tersedia di masing-masing layer - lihat
+    # layers/layer9_scoring.py untuk detail gradasinya per kategori.
     scoring_weights: dict = field(default_factory=lambda: {
-        "trend_aligned": 20,
-        "bos": 15,
-        "order_block": 15,
-        "fvg": 10,
-        "volume_spike": 10,
-        "rsi": 5,
-        "macd": 5,
-        "atr_high": 5,
-        "not_near_resistance": 5,
-        "btc_regime_aligned": 5,
-        "oi_confirmation": 5,
+        "regime_4h": 10,
+        "structure_1h": 15,
+        "liquidity_event": 15,
+        "smc_location": 15,
+        "entry_trigger_15m": 15,
+        "volume": 10,
+        "momentum": 5,
+        "oi": 5,
+        "risk_quality": 10,
     })
+
+    # ---------- Layer 9 - Correlation Awareness (Phase 7) ----------
+    # CATATAN: item "Correlation awareness" di ringkasan_perbaikan.md Phase 7 checklist tidak
+    # punya spesifikasi detail (tidak ada section tersendiri seperti P1.1-P1.11) - jadi ini
+    # interpretasi saya: karena mayoritas altcoin di watchlist sangat berkorelasi dengan BTC
+    # (lihat layer0_btc_regime.py), banyak sinyal SEARAH yang muncul BERSAMAAN dalam satu siklus
+    # scan kemungkinan besar bukan N edge independen, melainkan 1 pergerakan market yang
+    # kebetulan lolos syarat teknikal di banyak coin sekaligus ("BTC-beta", bukan alpha
+    # per-coin). Ini TIDAK memblokir/mengurangi skor (skor tetap confluence score per-setup,
+    # bukan win probability - sesuai filosofi P1.11) - hanya ditambahkan sebagai METADATA
+    # kesadaran risiko di signal & Telegram (lihat core/correlation_tracker.py), supaya user
+    # tidak salah membaca "5 sinyal LONG A+ sekaligus" sebagai 5x independent conviction.
+    correlation_warn_threshold: int = _get_int("CORRELATION_WARN_THRESHOLD", 3)
 
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
 

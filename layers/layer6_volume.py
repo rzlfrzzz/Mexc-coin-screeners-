@@ -39,3 +39,4 @@ def run(raw_data: dict) -> LayerResult:
 
     return LayerResult(6, "Volume", LayerStatus.PASS,
                         f"Volume spike {pct_of_avg:.0f}% dari rata-rata SMA20", data)
+                           

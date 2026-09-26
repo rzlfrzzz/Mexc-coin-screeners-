@@ -41,6 +41,21 @@ def _base_symbol(symbol: str) -> str:
     return base
 
 
+OI_LABELS = {
+    "LONG_BUILDUP": "Long Buildup",
+    "SHORT_BUILDUP": "Short Buildup",
+    "SHORT_COVERING": "Short Covering",
+    "LONG_LIQUIDATION": "Long Liquidation",
+    "NEUTRAL": "Netral",
+}
+
+
+def _oi_label(classification) -> str:
+    if classification is None:
+        return "Data tidak tersedia"
+    return OI_LABELS.get(classification, classification)
+
+
 DIVIDER = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
 
 DISCLAIMER = (
@@ -74,15 +89,50 @@ def format_signal_message(signal: TradeSignal) -> str:
         f"{_check_mark(snap.get('fvg_valid'))} FVG           : {'Valid' if snap.get('fvg_valid') else 'Tidak ada'}",
         f"{_check_mark(snap.get('volume_spike'))} Volume        : {snap.get('volume_pct_of_avg', 0):.0f}% dari rata-rata",
         f"{_check_mark(snap.get('rsi_ok'))} RSI           : {snap.get('rsi', 0):.0f}",
-        f"{_check_mark(snap.get('atr_high'))} ATR           : {'Tinggi' if snap.get('atr_high') else 'Rendah'}",
-        f"{_check_mark(snap.get('not_near_resistance'))} Tidak dekat R : {'Aman' if snap.get('not_near_resistance') else 'Dekat resistance'}",
+        # ATR & "tidak dekat resistance" sengaja hanya INFORMASIONAL mulai Phase 7 - tidak
+        # lagi ikut dihitung ke skor Layer 9 (lihat config.py::scoring_weights, P1.11: sengaja
+        # mengurangi ketergantungan pada ATR; "not_near_resistance" sudah redundan dengan
+        # validasi MIN_RR di Layer 8).
+        f"{_check_mark(snap.get('atr_high'))} ATR (info)    : {'Tinggi' if snap.get('atr_high') else 'Rendah'}",
         f"{_check_mark(snap.get('btc_regime_aligned'))} BTC Regime    : {snap.get('btc_direction', '-') or '-'}",
-        f"{_check_mark(snap.get('oi_confirmation'))} OI Confirm    : {_fmt_pct(snap.get('oi_change_pct'))}",
+        f"{_check_mark(snap.get('oi_confirmation'))} OI            : {_oi_label(snap.get('oi_direction'))} "
+        f"(OI {_fmt_pct(snap.get('oi_change_pct'))}, Price {_fmt_pct(snap.get('oi_price_change_pct'))})",
         "",
     ]
 
+    if signal.score and signal.score.breakdown:
+        b = signal.score.breakdown
+        lines += [
+            "🧮 <b>Score Breakdown</b>",
+            f"4H Regime      : {b.get('regime_4h', 0):.0f}/{settings.scoring_weights['regime_4h']}",
+            f"1H Structure   : {b.get('structure_1h', 0):.0f}/{settings.scoring_weights['structure_1h']}",
+            f"Liquidity Event: {b.get('liquidity_event', 0):.0f}/{settings.scoring_weights['liquidity_event']}",
+            f"SMC Location   : {b.get('smc_location', 0):.0f}/{settings.scoring_weights['smc_location']}",
+            f"15M Trigger    : {b.get('entry_trigger_15m', 0):.0f}/{settings.scoring_weights['entry_trigger_15m']}",
+            f"Volume         : {b.get('volume', 0):.0f}/{settings.scoring_weights['volume']}",
+            f"Momentum       : {b.get('momentum', 0):.0f}/{settings.scoring_weights['momentum']}",
+            f"OI             : {b.get('oi', 0):.0f}/{settings.scoring_weights['oi']}",
+            f"Risk Quality   : {b.get('risk_quality', 0):.0f}/{settings.scoring_weights['risk_quality']}",
+            "",
+        ]
+
     if signal.soft_fail_layers:
         lines += [f"ℹ️ Catatan: {', '.join(signal.soft_fail_layers)} tidak lolos penuh (skor dikurangi, bukan diblokir)", ""]
+
+    # Correlation awareness (Phase 7, lihat core/correlation_tracker.py) - metadata kesadaran
+    # risiko, BUKAN bagian skor. Hanya ditampilkan kalau melewati threshold (tidak menambah
+    # noise di setiap sinyal normal).
+    corr = getattr(signal, "correlation_meta", None) or {}
+    if corr.get("high_correlation_risk"):
+        n = corr.get("same_direction_signals_this_scan", 0)
+        others = ", ".join(corr.get("same_direction_symbols_this_scan", []))
+        lines += [
+            f"⚠️ <b>Correlation Awareness</b>: {n} sinyal {signal.direction.value} lain sudah lolos "
+            f"di scan yang sama ({others}). Kemungkinan BTC-beta/market-wide move, bukan edge "
+            f"independen per-coin - pertimbangkan total exposure, jangan dihitung sebagai N sinyal "
+            f"yang saling independen.",
+            "",
+        ]
 
     if signal.risk_plan:
         rp = signal.risk_plan

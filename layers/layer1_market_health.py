@@ -99,3 +99,4 @@ def run(raw_data: dict) -> LayerResult:
                                 data)
 
     return LayerResult(1, "Market Health", LayerStatus.PASS, "Coin layak ditradingkan", data)
+  

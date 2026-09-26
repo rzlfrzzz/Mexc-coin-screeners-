@@ -15,6 +15,8 @@ import pandas as pd
 from loguru import logger
 
 from config import settings
+from core.metrics import scan_metrics
+from indicators.technical import classify_price_oi_direction
 
 # Error transient yang layak di-retry (network blip, rate limit sesaat, exchange maintenance
 # singkat). Error di LUAR daftar ini (mis. BadSymbol, AuthenticationError, InvalidOrder)
@@ -44,9 +46,11 @@ class ExchangeClient:
         # jadi sengaja TIDAK dipanggil sama sekali. Warning ke user sudah dilakukan
         # di config.validate_settings() kalau EXCHANGE_SANDBOX=true di .env.
         self._markets_loaded = False
-        # Cache OI terakhir per symbol {symbol: (timestamp, oi_usd)} supaya bisa hitung
-        # % perubahan OI antar-scan tanpa perlu endpoint historical OI (yang belum tentu
-        # didukung ccxt untuk MEXC).
+        # Cache OI + price terakhir per symbol {symbol: (timestamp, oi_value, price)} supaya
+        # bisa hitung % perubahan OI *dan* price antar-scan tanpa perlu endpoint historical OI
+        # (yang belum tentu didukung ccxt untuk MEXC) - price ikut disimpan supaya OI bisa
+        # dibaca sebagai price x OI directional model (lihat fetch_oi_price_model()), bukan
+        # cuma "OI naik/turun" sendirian.
         self._oi_history: dict = {}
 
     @staticmethod
@@ -55,19 +59,33 @@ class ExchangeClient:
         Panggil fn(*args, **kwargs) dengan retry + exponential backoff untuk error transient
         (lihat RETRYABLE_ERRORS). Error non-transient langsung dilempar ulang tanpa retry.
         Percobaan & delay diatur lewat settings.api_max_retries / api_retry_base_delay_sec.
+
+        Instrumentasi (Phase 8 - lihat core/metrics.py & ringkasan_perbaikan.md P2):
+        SETIAP percobaan (termasuk retry) dihitung sebagai satu request_count, supaya
+        watchlist_stress_test.py bisa membandingkan beban API riil di watchlist 100 vs
+        150 vs 200 symbol - bukan cuma menduga dari elapsed time saja.
         """
         last_error = None
         for attempt in range(settings.api_max_retries + 1):
+            scan_metrics.record_request()
             try:
                 return fn(*args, **kwargs)
             except RETRYABLE_ERRORS as e:
                 last_error = e
                 if attempt >= settings.api_max_retries:
+                    scan_metrics.record_failed_request()
                     break
+                scan_metrics.record_retry()
                 delay = settings.api_retry_base_delay_sec * (2 ** attempt)
                 logger.warning(f"Retryable error ({type(e).__name__}: {e}), "
                                 f"percobaan {attempt + 1}/{settings.api_max_retries}, retry dalam {delay:.1f}s")
                 time.sleep(delay)
+            except Exception:
+                # Error non-transient (BadSymbol, AuthenticationError, dst) - tidak di-retry,
+                # tapi tetap dihitung sebagai failed_requests sebelum dilempar ulang, supaya
+                # metrics tidak diam-diam kehilangan kegagalan definitif ini.
+                scan_metrics.record_failed_request()
+                raise
         raise last_error
 
     @staticmethod
@@ -210,42 +228,60 @@ class ExchangeClient:
             logger.warning(f"[{symbol}] Funding rate tidak tersedia ({e}), filter funding di-skip untuk symbol ini")
             return None
 
-    def fetch_open_interest_change_pct(self, symbol: str, ticker: dict = None):
+    def fetch_oi_price_model(self, symbol: str, ticker: dict = None):
         """
-        Ambil Open Interest saat ini, lalu bandingkan dengan nilai OI symbol ini yang
-        tercatat pada scan sebelumnya untuk menghasilkan % perubahan OI antar-scan (proxy
-        sederhana untuk "apakah posisi baru sedang dibangun", bukan OI history resmi).
-        Return None kalau data tidak tersedia atau ini scan pertama untuk symbol tsb
-        (belum ada baseline pembanding).
+        Ambil Open Interest + price SAAT INI, lalu bandingkan KEDUANYA dengan nilai OI/price
+        symbol ini yang tercatat pada scan sebelumnya, untuk menghasilkan price x OI
+        directional model (lihat indicators.technical.classify_price_oi_direction) - BUKAN
+        cuma "% perubahan OI" mentah seperti skema lama (yang menganggap "OI naik" selalu
+        bullish tanpa peduli arah harga, padahal OI naik + price turun justru SHORT_BUILDUP,
+        bukan konfirmasi bullish). Return None kalau data tidak tersedia atau ini scan
+        pertama untuk symbol tsb (belum ada baseline pembanding).
 
         PENTING: ccxt.mexc TIDAK meng-implementasikan fetch_open_interest() (selalu raise
         NotSupported untuk MEXC per ccxt 4.5.x), jadi endpoint itu sengaja TIDAK dipakai.
         Sebagai gantinya, OI diambil dari field `holdVol` yang dikembalikan MEXC pada
         endpoint publik GET /api/v1/contract/ticker (satuan: jumlah kontrak/lot yang masih
-        open, bukan nilai notional USD). ccxt menaruh response mentah tsb di ticker["info"],
-        jadi ticker yang sudah difetch di safe_fetch_all() bisa dipakai ulang di sini tanpa
-        request tambahan - kalau tidak diberikan, baru fetch_ticker() sendiri sebagai fallback.
+        open, bukan nilai notional USD), dan price diambil dari `ticker["last"]` (endpoint
+        yang sama, tanpa request tambahan). ccxt menaruh response mentah holdVol tsb di
+        ticker["info"], jadi ticker yang sudah difetch di safe_fetch_all() bisa dipakai ulang
+        di sini - kalau tidak diberikan, baru fetch_ticker() sendiri sebagai fallback.
+
+        Return dict {"oi_change_pct": float, "price_change_pct": float, "classification": str}
+        atau None (lihat di atas).
         """
         try:
             ticker = ticker if ticker is not None else self._call_with_retry(self.exchange.fetch_ticker, symbol)
             hold_vol = ticker.get("info", {}).get("holdVol")
-            if hold_vol is None:
+            last_price = ticker.get("last")
+            if hold_vol is None or last_price is None:
                 return None
             oi_value = float(hold_vol)
+            price_value = float(last_price)
         except Exception as e:
-            logger.warning(f"[{symbol}] Open interest (holdVol) tidak tersedia ({e}), OI confirmation di-skip untuk symbol ini")
+            logger.warning(f"[{symbol}] Open interest/price (holdVol/last) tidak tersedia ({e}), "
+                            f"OI directional model di-skip untuk symbol ini")
             return None
 
         now = time.time()
         prev = self._oi_history.get(symbol)
-        self._oi_history[symbol] = (now, oi_value)
+        self._oi_history[symbol] = (now, oi_value, price_value)
 
-        if prev is None or prev[1] == 0:
+        if prev is None or len(prev) < 3 or prev[1] == 0 or prev[2] == 0:
             return None
 
-        prev_ts, prev_oi = prev
-        change_pct = (oi_value - prev_oi) / prev_oi * 100
-        return change_pct
+        _, prev_oi, prev_price = prev
+        oi_change_pct = (oi_value - prev_oi) / prev_oi * 100
+        price_change_pct = (price_value - prev_price) / prev_price * 100
+        classification = classify_price_oi_direction(
+            price_change_pct, oi_change_pct,
+            settings.oi_price_min_change_pct, settings.oi_confirmation_min_change_pct,
+        )
+        return {
+            "oi_change_pct": round(oi_change_pct, 4),
+            "price_change_pct": round(price_change_pct, 4),
+            "classification": classification,
+        }
 
     def fetch_top_volume_symbols(self, top_n: int = 20, quote: str = "USDT") -> list:
         """
@@ -300,7 +336,9 @@ class ExchangeClient:
                 "funding_rate_pct": self.fetch_funding_rate_pct(symbol),
                 # Teruskan ticker yang sudah difetch di atas supaya holdVol (proxy OI)
                 # diambil dari response yang sama, tanpa request tambahan ke exchange.
-                "oi_change_pct": self.fetch_open_interest_change_pct(symbol, ticker=ticker),
+                # None kalau data OI/price pembanding belum ada (lihat fetch_oi_price_model),
+                # dict {"oi_change_pct", "price_change_pct", "classification"} kalau berhasil.
+                "oi_price_model": self.fetch_oi_price_model(symbol, ticker=ticker),
             }
             return data
         except Exception as e:

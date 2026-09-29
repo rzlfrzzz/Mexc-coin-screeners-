@@ -15,6 +15,11 @@ bukan cuma "ketemu atau tidak":
 3. Liquidity Sweep      : diklasifikasi jadi SWING_SWEEP (swing high/low tunggal yang
    disapu) atau EQUAL_HIGH_SWEEP/EQUAL_LOW_SWEEP (2+ swing dengan harga hampir sama yang
    disapu sekaligus - liquidity pool yang lebih kuat karena stop menumpuk di level itu).
+   Timeline sweep disimpan TERPISAH di `zone.meta` (perbaikan P0): pool_formed_at (kapan
+   swing/pool terbentuk), sweep_event_at (kapan candle sweep menembus level - juga jadi
+   `formed_at`), swept_level, sweep_extreme, reclaim_at. Zona OB/FVG menyimpan
+   `meta["ready_candle_at"]` = candle terakhir yang dibutuhkan agar zona itu valid, dipakai
+   Layer 7 untuk memastikan zona SUDAH tersedia sebelum context window dimulai.
 """
 
 import pandas as pd
@@ -109,7 +114,10 @@ def find_fvgs(df: pd.DataFrame, direction: Direction, lookback: int = 40):
                 zone_type="fvg", direction=Direction.LONG, top=top, bottom=bottom, index=i,
                 valid=state in (FVG_FRESH, FVG_PARTIALLY_FILLED),
                 formed_at=recent.index[formed_idx].isoformat(),
-                meta={"state": state, "fill_ratio": round(fill_ratio, 3), "age_bars": age_bars},
+                meta={"state": state, "fill_ratio": round(fill_ratio, 3), "age_bars": age_bars,
+                      # FVG baru "ada" begitu candle ketiga CLOSED - lihat _zone_available_at()
+                      # di Layer 7 (open time candle ini + durasi TF structure = waktu tersedia).
+                      "ready_candle_at": recent.index[formed_idx].isoformat()},
             ))
         if direction == Direction.SHORT and next_high < prev_low:
             top, bottom = float(prev_low), float(next_high)
@@ -120,7 +128,10 @@ def find_fvgs(df: pd.DataFrame, direction: Direction, lookback: int = 40):
                 zone_type="fvg", direction=Direction.SHORT, top=top, bottom=bottom, index=i,
                 valid=state in (FVG_FRESH, FVG_PARTIALLY_FILLED),
                 formed_at=recent.index[formed_idx].isoformat(),
-                meta={"state": state, "fill_ratio": round(fill_ratio, 3), "age_bars": age_bars},
+                meta={"state": state, "fill_ratio": round(fill_ratio, 3), "age_bars": age_bars,
+                      # FVG baru "ada" begitu candle ketiga CLOSED - lihat _zone_available_at()
+                      # di Layer 7 (open time candle ini + durasi TF structure = waktu tersedia).
+                      "ready_candle_at": recent.index[formed_idx].isoformat()},
             ))
     return zones
 
@@ -207,6 +218,36 @@ def _confirmed_by_bos(recent: pd.DataFrame, i: int, expected_direction: str, str
     return 0 <= bars_between <= settings.ob_bos_confirm_max_bars
 
 
+def _bos_position(recent: pd.DataFrame, structure_snapshot: dict):
+    """Posisi (index relatif di `recent`) candle BOS dari snapshot Layer 3, atau None."""
+    if not structure_snapshot:
+        return None
+    bos_ts_str = structure_snapshot.get("bos_timestamp")
+    if not bos_ts_str:
+        return None
+    try:
+        return int(recent.index.searchsorted(pd.Timestamp(bos_ts_str)))
+    except Exception:
+        return None
+
+
+def _ob_ready_candle_at(recent: pd.DataFrame, i: int, structure_snapshot: dict):
+    """
+    Open time candle TERAKHIR yang dibutuhkan supaya OB ini bisa dinyatakan valid:
+    OB "valid" = displacement (candle i+1 .. i+lookforward) DAN BOS terkonfirmasi - keduanya
+    baru DIKETAHUI setelah candle-candle itu closed. Zona OB yang candle-nya terbentuk lebih
+    awal tapi konfirmasinya (displacement/BOS) baru selesai belakangan TIDAK boleh dianggap
+    sudah tersedia sebelum konfirmasi itu ada (look-ahead) - lihat Layer 7 _zone_available_at().
+    Return ISO timestamp, atau None kalau tidak bisa ditentukan.
+    """
+    n = len(recent)
+    displacement_end = min(i + settings.ob_displacement_lookforward_bars, n - 1)
+    bos_pos = _bos_position(recent, structure_snapshot)
+    ready_pos = max(displacement_end, bos_pos if bos_pos is not None else displacement_end)
+    ready_pos = min(max(ready_pos, i), n - 1)
+    return recent.index[ready_pos].isoformat()
+
+
 def find_order_blocks(df: pd.DataFrame, direction: Direction, lookback: int = 40,
                        structure_snapshot: dict = None):
     """
@@ -249,6 +290,7 @@ def find_order_blocks(df: pd.DataFrame, direction: Direction, lookback: int = 40
                     "mitigated": mitigated,
                     "invalidated": invalidated,
                     "confirmed_by_bos": confirmed_by_bos,
+                    "ready_candle_at": _ob_ready_candle_at(recent, i, structure_snapshot),
                 },
             ))
         if direction == Direction.SHORT and not bullish_impulse and prev_bullish:
@@ -271,6 +313,7 @@ def find_order_blocks(df: pd.DataFrame, direction: Direction, lookback: int = 40
                     "mitigated": mitigated,
                     "invalidated": invalidated,
                     "confirmed_by_bos": confirmed_by_bos,
+                    "ready_candle_at": _ob_ready_candle_at(recent, i, structure_snapshot),
                 },
             ))
     return zones
@@ -315,12 +358,105 @@ def find_equal_lows(swings: list, tolerance_pct: float):
     return _cluster_equal_levels([s for s in swings if s["type"] == "low"], tolerance_pct)
 
 
+def _locate_sweep(df: pd.DataFrame, direction: Direction, level: float, pool_pos: int):
+    """
+    Cari EVENT sweep terhadap `level` di 3 candle terakhir `df`, dengan syarat urutan waktu:
+    candle sweep harus STRICTLY SETELAH candle pool/swing yang disapu (`pool_pos`) - swing
+    itu sendiri (yang low/high-nya bisa kebetulan sedikit menembus rata-rata level equal
+    high/low) tidak boleh dihitung sebagai "penyapu" dirinya sendiri.
+
+    LONG  : sweep candle = candle PERTAMA dengan low < level; reclaim = candle pertama (sejak
+            sweep candle, boleh candle sweep itu sendiri) yang CLOSE > level.
+    SHORT : cermin (high > level / close < level).
+    Return (sweep_pos, reclaim_pos) - posisi di `df` - atau None kalau bukan sweep valid
+    (tidak ada penembusan, atau close candle terakhir belum kembali ke dalam range).
+    """
+    n = len(df)
+    start = max(n - 3, pool_pos + 1)
+    if start >= n:
+        return None
+    long_side = direction == Direction.LONG
+
+    sweep_pos = None
+    for pos in range(start, n):
+        if long_side and float(df["low"].iloc[pos]) < level:
+            sweep_pos = pos
+            break
+        if not long_side and float(df["high"].iloc[pos]) > level:
+            sweep_pos = pos
+            break
+    if sweep_pos is None:
+        return None
+
+    last_close = float(df["close"].iloc[-1])
+    if (long_side and not last_close > level) or (not long_side and not last_close < level):
+        return None
+
+    reclaim_pos = None
+    for pos in range(sweep_pos, n):
+        close_p = float(df["close"].iloc[pos])
+        if (long_side and close_p > level) or (not long_side and close_p < level):
+            reclaim_pos = pos
+            break
+    if reclaim_pos is None:  # tidak mungkin terjadi (last_close sudah lolos), tapi fail-safe
+        return None
+    return sweep_pos, reclaim_pos
+
+
+def _build_sweep_zone(df: pd.DataFrame, direction: Direction, level: float, pool_pos: int,
+                       sweep_pos: int, reclaim_pos: int, sweep_type: str, extra_meta: dict = None):
+    """
+    Bangun SmartMoneyZone untuk sweep dengan timeline LENGKAP dan terpisah:
+      pool_formed_at : kapan pool/swing likuiditas yang disapu TERBENTUK (candle swing-nya)
+      sweep_event_at : kapan candle SWEEP menembus level  <- timestamp kunci untuk Layer 7
+      swept_level    : harga level yang disapu
+      sweep_extreme  : low (LONG) / high (SHORT) dari candle sweep itu sendiri
+      reclaim_at     : kapan close pertama kembali ke sisi dalam level
+    `formed_at` zona = sweep_event_at (BUKAN waktu swing) - sebelumnya formed_at diisi
+    waktu swing yang disapu, sehingga umur sweep & urutan sweep -> reaksi -> displacement
+    di Layer 7 dihitung dari waktu yang salah (bisa berjam-jam lebih tua dari sweep aslinya).
+    `bottom`/`top` (batas zona) tetap: level yang disapu s/d ekstrem terjauh sejak sweep.
+    """
+    long_side = direction == Direction.LONG
+    sweep_candle = df.iloc[sweep_pos]
+    after_sweep = df.iloc[sweep_pos:]
+    sweep_extreme = float(sweep_candle["low"] if long_side else sweep_candle["high"])
+    window_extreme = float(after_sweep["low"].min() if long_side else after_sweep["high"].max())
+
+    meta = {
+        "sweep_type": sweep_type,
+        "swept_level": float(level),
+        "pool_formed_at": df.index[pool_pos].isoformat(),
+        "sweep_event_at": df.index[sweep_pos].isoformat(),
+        "sweep_extreme": sweep_extreme,
+        "reclaim_at": df.index[reclaim_pos].isoformat(),
+    }
+    if extra_meta:
+        meta.update(extra_meta)
+
+    return SmartMoneyZone(
+        zone_type="liquidity_sweep", direction=direction,
+        top=float(level) if long_side else window_extreme,
+        bottom=window_extreme if long_side else float(level),
+        index=sweep_pos,                       # posisi candle SWEEP (bukan swing) - konsisten dgn formed_at
+        formed_at=df.index[sweep_pos].isoformat(),
+        meta=meta,
+    )
+
+
 def find_liquidity_sweep(df: pd.DataFrame, direction: Direction, lookback: int = None):
     """
-    Cek apakah candle terakhir (2-3 terakhir) menyapu liquidity lalu close balik ke dalam
-    range -> sweep valid. Diklasifikasi EQUAL_HIGH/LOW_SWEEP (diprioritaskan, liquidity pool
-    lebih kuat karena 2+ swing menumpuk di level hampir sama) atau SWING_SWEEP (swing
-    signifikan tunggal terakhir) sebagai fallback.
+    Cek apakah 3 candle terakhir menyapu liquidity lalu close balik ke dalam range -> sweep
+    valid. Diklasifikasi EQUAL_HIGH/LOW_SWEEP (diprioritaskan, liquidity pool lebih kuat
+    karena 2+ swing menumpuk di level hampir sama) atau SWING_SWEEP (swing signifikan tunggal
+    terakhir) sebagai fallback.
+
+    TIMESTAMP (perbaikan P0): yang disimpan sebagai `formed_at` / `meta["sweep_event_at"]`
+    adalah waktu candle yang MENYAPU level (df.index[sweep_pos]), BUKAN waktu swing/pool
+    yang disapu (itu masuk `meta["pool_formed_at"]`). Untuk equal high/low, `pool_formed_at`
+    = candle swing TERAKHIR pembentuk pool (saat pool itu lengkap), dan candle sweep wajib
+    strictly setelahnya. Lihat _locate_sweep() & _build_sweep_zone().
+
     `lookback` idealnya adalah swing_lookback adaptif yang sama yang dipakai Layer 3
     (raw_data["swing_lookback"]) supaya definisi swing konsisten di seluruh pipeline
     untuk satu symbol yang sama.
@@ -329,63 +465,31 @@ def find_liquidity_sweep(df: pd.DataFrame, direction: Direction, lookback: int =
     if not swings or len(df) < 5:
         return None
 
-    last_candles = df.iloc[-3:]
     tol = settings.equal_level_tolerance_pct
+    long_side = direction == Direction.LONG
 
-    if direction == Direction.LONG:
-        equal_lows = find_equal_lows(swings, tol)
-        if equal_lows and equal_lows["count"] >= 2:
-            level = equal_lows["price"]
-            swept = (last_candles["low"] < level).any()
-            closed_back_above = last_candles["close"].iloc[-1] > level
-            if swept and closed_back_above:
-                return SmartMoneyZone(
-                    zone_type="liquidity_sweep", direction=Direction.LONG,
-                    top=float(level), bottom=float(last_candles["low"].min()),
-                    index=equal_lows["last_index"],
-                    formed_at=df.index[equal_lows["last_index"]].isoformat(),
-                    meta={"sweep_type": SWEEP_EQUAL_LOW, "swept_level": level, "pool_count": equal_lows["count"]},
-                )
-        recent_lows = [s for s in swings if s["type"] == "low"]
-        if not recent_lows:
-            return None
-        target = recent_lows[-1]
-        swept = (last_candles["low"] < target["price"]).any()
-        closed_back_above = last_candles["close"].iloc[-1] > target["price"]
-        if swept and closed_back_above:
-            return SmartMoneyZone(
-                zone_type="liquidity_sweep", direction=Direction.LONG,
-                top=float(target["price"]), bottom=float(last_candles["low"].min()),
-                index=target["index"], formed_at=df.index[target["index"]].isoformat(),
-                meta={"sweep_type": SWEEP_SWING, "swept_level": target["price"]},
+    pool = find_equal_lows(swings, tol) if long_side else find_equal_highs(swings, tol)
+    if pool and pool["count"] >= 2:
+        level = float(pool["price"])
+        located = _locate_sweep(df, direction, level, pool["last_index"])
+        if located:
+            sweep_pos, reclaim_pos = located
+            return _build_sweep_zone(
+                df, direction, level, pool["last_index"], sweep_pos, reclaim_pos,
+                SWEEP_EQUAL_LOW if long_side else SWEEP_EQUAL_HIGH,
+                extra_meta={"pool_count": pool["count"]},
             )
-    else:
-        equal_highs = find_equal_highs(swings, tol)
-        if equal_highs and equal_highs["count"] >= 2:
-            level = equal_highs["price"]
-            swept = (last_candles["high"] > level).any()
-            closed_back_below = last_candles["close"].iloc[-1] < level
-            if swept and closed_back_below:
-                return SmartMoneyZone(
-                    zone_type="liquidity_sweep", direction=Direction.SHORT,
-                    top=float(last_candles["high"].max()), bottom=float(level),
-                    index=equal_highs["last_index"],
-                    formed_at=df.index[equal_highs["last_index"]].isoformat(),
-                    meta={"sweep_type": SWEEP_EQUAL_HIGH, "swept_level": level, "pool_count": equal_highs["count"]},
-                )
-        recent_highs = [s for s in swings if s["type"] == "high"]
-        if not recent_highs:
-            return None
-        target = recent_highs[-1]
-        swept = (last_candles["high"] > target["price"]).any()
-        closed_back_below = last_candles["close"].iloc[-1] < target["price"]
-        if swept and closed_back_below:
-            return SmartMoneyZone(
-                zone_type="liquidity_sweep", direction=Direction.SHORT,
-                top=float(last_candles["high"].max()), bottom=float(target["price"]),
-                index=target["index"], formed_at=df.index[target["index"]].isoformat(),
-                meta={"sweep_type": SWEEP_SWING, "swept_level": target["price"]},
-            )
+
+    same_type = [s for s in swings if s["type"] == ("low" if long_side else "high")]
+    if not same_type:
+        return None
+    target = same_type[-1]
+    level = float(target["price"])
+    located = _locate_sweep(df, direction, level, int(target["index"]))
+    if located:
+        sweep_pos, reclaim_pos = located
+        return _build_sweep_zone(df, direction, level, int(target["index"]), sweep_pos,
+                                  reclaim_pos, SWEEP_SWING)
     return None
 
 

@@ -139,12 +139,45 @@ class ExchangeClient:
 
         return df.tail(limit)
 
-    def fetch_ohlcv_since_df(self, symbol: str, timeframe: str, since_ms: int, limit: int = 1000) -> pd.DataFrame:
+    def _drop_unclosed_rows(self, df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+        """
+        Buang candle yang BELUM CLOSED: close time = open time (index) + durasi timeframe;
+        kalau close time itu masih di masa depan (> sekarang), candle tsb masih terus
+        terbentuk (high/low/close-nya belum final). Dipakai fetch_ohlcv_since_df() dan
+        fetch_ohlcv_range_df().
+
+        Perbandingan memakai Timedelta/Timestamp (bukan konversi index ke integer) supaya
+        benar apa pun resolusi datetime index-nya (ns/ms - pandas 3 bisa memakai ms).
+        Fail-safe: kalau status closed tidak bisa ditentukan (mis. timeframe tak dikenal),
+        candle TERAKHIR dibuang - kehilangan satu candle hanya menunda evaluasi satu siklus,
+        sedangkan memakai candle yang mungkin belum closed justru mengulang bug aslinya.
+        """
+        if df.empty:
+            return df
+        try:
+            tf_delta = pd.Timedelta(seconds=int(self.exchange.parse_timeframe(timeframe)))
+            now = pd.Timestamp.now(tz="UTC")
+            return df[(df.index + tf_delta) <= now]
+        except Exception as e:
+            logger.warning(f"Gagal cek status closed candle untuk timeframe {timeframe} ({e}), "
+                           f"candle terakhir dibuang sebagai langkah aman")
+            return df.iloc[:-1]
+
+    def fetch_ohlcv_since_df(self, symbol: str, timeframe: str, since_ms: int, limit: int = 1000,
+                              drop_unclosed: bool = True) -> pd.DataFrame:
         """
         Ambil candlestick sejak timestamp tertentu (ms epoch) sampai sekarang - dipakai oleh
         outcome_tracker.py (mengecek pergerakan harga sejak signal digenerate) dan backtest.py
         (mengambil data historis untuk simulasi). Sama seperti fetch_ohlcv_df tapi pakai
         parameter `since` alih-alih hanya limit candle terakhir.
+
+        drop_unclosed (default True): buang candle yang close time-nya masih di masa depan.
+        Tanpa ini (perilaku lama) candle 5M yang baru berjalan 3 menit bisa ikut dievaluasi -
+        high-nya yang SEMENTARA menyentuh TP/SL langsung dianggap final oleh outcome_tracker,
+        padahal candle itu belum selesai dan bisa saja berbalik. Perilaku ini sengaja TIDAK
+        bergantung pada settings.drop_unclosed_candle (flag itu untuk data analisis di
+        fetch_ohlcv_df): untuk penentuan outcome, candle unclosed tidak pernah boleh dipakai.
+        Pemanggil yang memang butuh candle live (jarang) bisa set drop_unclosed=False.
         """
         raw = self._call_with_retry(self.exchange.fetch_ohlcv, symbol, timeframe=timeframe,
                                      since=since_ms, limit=limit)
@@ -153,10 +186,13 @@ class ExchangeClient:
             return df
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         df.set_index("timestamp", inplace=True)
+        if drop_unclosed:
+            df = self._drop_unclosed_rows(df, timeframe)
         return df
 
     def fetch_ohlcv_range_df(self, symbol: str, timeframe: str, since_ms: int,
-                              until_ms: int = None, page_limit: int = 1000) -> pd.DataFrame:
+                              until_ms: int = None, page_limit: int = 1000,
+                              drop_unclosed: bool = True) -> pd.DataFrame:
         """
         Sama seperti fetch_ohlcv_since_df, tapi dengan PAGINASI - dipakai backtest.py untuk
         mengambil data timeframe granular (mis. 15m) mencakup periode yang panjang (mis. 60
@@ -194,10 +230,160 @@ class ExchangeClient:
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         df.set_index("timestamp", inplace=True)
         df = df[~df.index.duplicated(keep="last")].sort_index()
-        return df[df.index <= pd.to_datetime(until_ms, unit="ms", utc=True)]
+        df = df[df.index <= pd.to_datetime(until_ms, unit="ms", utc=True)]
+        # Sama seperti fetch_ohlcv_since_df: candle terakhir yang belum closed dibuang supaya
+        # backtest tidak mengevaluasi outcome/entry terhadap candle yang masih berjalan.
+        if drop_unclosed:
+            df = self._drop_unclosed_rows(df, timeframe)
+        return df
 
     def fetch_ticker(self, symbol: str) -> dict:
         return self._call_with_retry(self.exchange.fetch_ticker, symbol)
+
+    def fetch_order_book_spread_pct(self, symbol: str) -> float:
+        """Spread bid-ask dalam persen relatif terhadap mid price."""
+        ob = self._call_with_retry(self.exchange.fetch_order_book, symbol, limit=5)
+        if not ob["bids"] or not ob["asks"]:
+            return float("inf")
+        best_bid = ob["bids"][0][0]
+        best_ask = ob["asks"][0][0]
+        mid = (best_bid + best_ask) / 2
+        if mid == 0:
+            return float("inf")
+        return (best_ask - best_bid) / mid * 100
+
+    def fetch_funding_rate_pct(self, symbol: str):
+        """
+        Ambil funding rate saat ini (dalam persen, mis. 0.35 = 0.35% per interval funding)
+        via endpoint publik ccxt fetch_funding_rate(). Return None kalau tidak didukung/gagal
+        setelah retry (dipakai untuk graceful degradation - filter funding di Layer 1
+        di-skip, bukan crash, kalau data tidak tersedia).
+        """
+        try:
+            fr = self._call_with_retry(self.exchange.fetch_funding_rate, symbol)
+            rate = fr.get("fundingRate")
+            if rate is None:
+                return None
+            return float(rate) * 100
+        except Exception as e:
+            logger.warning(f"[{symbol}] Funding rate tidak tersedia ({e}), filter funding di-skip untuk symbol ini")
+            return None
+
+    def fetch_oi_price_model(self, symbol: str, ticker: dict = None):
+        """
+        Ambil Open Interest + price SAAT INI, lalu bandingkan KEDUANYA dengan nilai OI/price
+        symbol ini yang tercatat pada scan sebelumnya, untuk menghasilkan price x OI
+        directional model (lihat indicators.technical.classify_price_oi_direction) - BUKAN
+        cuma "% perubahan OI" mentah seperti skema lama (yang menganggap "OI naik" selalu
+        bullish tanpa peduli arah harga, padahal OI naik + price turun justru SHORT_BUILDUP,
+        bukan konfirmasi bullish). Return None kalau data tidak tersedia atau ini scan
+        pertama untuk symbol tsb (belum ada baseline pembanding).
+
+        PENTING: ccxt.mexc TIDAK meng-implementasikan fetch_open_interest() (selalu raise
+        NotSupported untuk MEXC per ccxt 4.5.x), jadi endpoint itu sengaja TIDAK dipakai.
+        Sebagai gantinya, OI diambil dari field `holdVol` yang dikembalikan MEXC pada
+        endpoint publik GET /api/v1/contract/ticker (satuan: jumlah kontrak/lot yang masih
+        open, bukan nilai notional USD), dan price diambil dari `ticker["last"]` (endpoint
+        yang sama, tanpa request tambahan). ccxt menaruh response mentah holdVol tsb di
+        ticker["info"], jadi ticker yang sudah difetch di safe_fetch_all() bisa dipakai ulang
+        di sini - kalau tidak diberikan, baru fetch_ticker() sendiri sebagai fallback.
+
+        Return dict {"oi_change_pct": float, "price_change_pct": float, "classification": str}
+        atau None (lihat di atas).
+        """
+        try:
+            ticker = ticker if ticker is not None else self._call_with_retry(self.exchange.fetch_ticker, symbol)
+            hold_vol = ticker.get("info", {}).get("holdVol")
+            last_price = ticker.get("last")
+            if hold_vol is None or last_price is None:
+                return None
+            oi_value = float(hold_vol)
+            price_value = float(last_price)
+        except Exception as e:
+            logger.warning(f"[{symbol}] Open interest/price (holdVol/last) tidak tersedia ({e}), "
+                            f"OI directional model di-skip untuk symbol ini")
+            return None
+
+        now = time.time()
+        prev = self._oi_history.get(symbol)
+        self._oi_history[symbol] = (now, oi_value, price_value)
+
+        if prev is None or len(prev) < 3 or prev[1] == 0 or prev[2] == 0:
+            return None
+
+        _, prev_oi, prev_price = prev
+        oi_change_pct = (oi_value - prev_oi) / prev_oi * 100
+        price_change_pct = (price_value - prev_price) / prev_price * 100
+        classification = classify_price_oi_direction(
+            price_change_pct, oi_change_pct,
+            settings.oi_price_min_change_pct, settings.oi_confirmation_min_change_pct,
+        )
+        return {
+            "oi_change_pct": round(oi_change_pct, 4),
+            "price_change_pct": round(price_change_pct, 4),
+            "classification": classification,
+        }
+
+    def fetch_top_volume_symbols(self, top_n: int = 20, quote: str = "USDT") -> list:
+        """
+        Ambil top-N symbol MEXC Futures (USDT-M perpetual) berdasarkan volume transaksi
+        24 jam terakhir (quoteVolume), pakai endpoint publik fetch_tickers() - tidak butuh
+        API key/secret. Dipakai untuk watchlist dinamis (lihat core/watchlist.py).
+        """
+        self.load_markets()
+        tickers = self._call_with_retry(self.exchange.fetch_tickers)
+
+        candidates = []
+        for symbol, market in self.exchange.markets.items():
+            # hanya USDT-M perpetual swap, quote currency sesuai parameter
+            if not market.get("swap") or market.get("quote") != quote:
+                continue
+            ticker = tickers.get(symbol)
+            if not ticker:
+                continue
+            vol = ticker.get("quoteVolume")
+            if vol is None:
+                # fallback: hitung dari baseVolume * last price kalau quoteVolume kosong
+                base_vol = ticker.get("baseVolume")
+                last = ticker.get("last")
+                vol = base_vol * last if base_vol and last else None
+            if vol is None:
+                continue
+            candidates.append((symbol, vol))
+
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return [sym for sym, _ in candidates[:top_n]]
+
+    def safe_fetch_all(self, symbol: str) -> dict:
+        """
+        Ambil semua data mentah yang dibutuhkan seluruh layer dalam satu panggilan,
+        supaya pipeline tidak berulang kali hit API untuk symbol yang sama.
+        """
+        try:
+            symbol = self.normalize_symbol(symbol)
+            ticker = self.fetch_ticker(symbol)
+            data = {
+                "symbol": symbol,
+                "ticker": ticker,
+                "spread_pct": self.fetch_order_book_spread_pct(symbol),
+                "ohlcv_htf": self.fetch_ohlcv_df(symbol, settings.tf_htf, limit=300),
+                # ohlcv_structure (default 1h) -> Layer 1/3/4 (ATR, struktur, SMC).
+                # ohlcv_entry     (default 15m)-> Layer 5/6/7/8 (momentum, volume, trigger, entry price).
+                # Lihat config.py untuk kenapa keduanya dipisah (P1 - Pisahkan Timeframe).
+                "ohlcv_structure": self.fetch_ohlcv_df(symbol, settings.tf_structure, limit=300),
+                "ohlcv_entry": self.fetch_ohlcv_df(symbol, settings.tf_entry, limit=300),
+                # None kalau tidak didukung/gagal - masing-masing layer wajib menangani None
+                # secara graceful (skip check), bukan menganggapnya sebagai kegagalan fetch total.
+                "funding_rate_pct": self.fetch_funding_rate_pct(symbol),
+                # Teruskan ticker yang sudah difetch di atas supaya holdVol (proxy OI)
+                # diambil dari response yang sama, tanpa request tambahan ke exchange.
+                # None kalau data OI/price pembanding belum ada (lihat fetch_oi_price_model),
+                # dict {"oi_change_pct", "price_change_pct", "classification"} kalau berhasil.
+                "oi_price_model": self.fetch_oi_price_model(symbol, ticker=ticker),
+            }
+            return data
+        except Exception as e:
+            logger.error(f"[{symboe.fetch_ticker, symbol)
 
     def fetch_order_book_spread_pct(self, symbol: str) -> float:
         """Spread bid-ask dalam persen relatif terhadap mid price."""

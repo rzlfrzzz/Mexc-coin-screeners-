@@ -22,6 +22,9 @@ kejadian yang sama (lihat ringkasan_perbaikan.md P0 & P0.2).
 
 - Candle dicek pada timeframe settings.tf_outcome (default 15m - lebih granular dari
   timeframe sinyal tf_structure) sejak generated_at, supaya urutan SL-vs-TP bisa dibedakan.
+- HANYA candle yang sudah CLOSED yang dicek (candle tf_outcome yang masih berjalan dibuang -
+  lihat exchange_client.fetch_ohlcv_since_df(drop_unclosed=True)), supaya TP/SL tidak
+  ter-trigger oleh high/low sementara dari candle yang belum selesai.
 - Kalau outcome sudah ketemu (TP1/2/3_FIRST atau SL_FIRST) -> tulis ke Supabase.
 - Kalau belum ada apa pun yang tersentuh:
   - umur signal < outcome_max_age_hours -> tetap OPEN, tidak diupdate (dicek lagi nanti).
@@ -32,11 +35,13 @@ kejadian yang sama (lihat ringkasan_perbaikan.md P0 & P0.2).
 import sys
 from datetime import datetime, timezone
 
+import pandas as pd
 from loguru import logger
 
 from config import settings
 from core.exchange_client import exchange_client
 from core.supabase_client import supabase_store
+from core.timeframes import timeframe_to_timedelta
 from trade_outcome import evaluate_trade_path, OPEN_EXPIRED
 
 
@@ -67,10 +72,21 @@ def _evaluate_signal(row: dict) -> dict | None:
     age_hours = (datetime.now(timezone.utc) - generated_dt).total_seconds() / 3600
 
     try:
-        df = exchange_client.fetch_ohlcv_since_df(symbol, settings.tf_outcome, since_ms, limit=1000)
+        # drop_unclosed=True EKSPLISIT: candle 5M yang masih berjalan tidak boleh ikut dicek
+        # terhadap TP/SL (high/low-nya belum final - bisa sementara menyentuh TP lalu berbalik).
+        df = exchange_client.fetch_ohlcv_since_df(symbol, settings.tf_outcome, since_ms, limit=1000,
+                                                   drop_unclosed=True)
     except Exception as e:
         logger.error(f"[{symbol}] Gagal fetch candle untuk tracking outcome: {e}")
         return None
+
+    # Guard kedua, independen dari exchange_client (defense-in-depth): apa pun yang dikembalikan
+    # fetcher, HANYA candle yang close time-nya (open + tf_outcome) sudah lewat yang boleh
+    # masuk ke evaluate_trade_path(). Kalau fetcher di-mock/di-refactor dan lupa membuang
+    # candle unclosed, bug TP/SL "kena sementara" tidak diam-diam kembali.
+    if not df.empty:
+        tf_delta = timeframe_to_timedelta(settings.tf_outcome)
+        df = df[(df.index + tf_delta) <= pd.Timestamp.now(tz="UTC")]
 
     # Candle PERTAMA dari fetch_ohlcv_since_df(since=generated_at) bisa jadi candle yang
     # SEDANG BERJALAN saat signal digenerate (bukan sepenuhnya "setelah" entry) - buang

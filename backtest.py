@@ -62,6 +62,7 @@ from loguru import logger
 from config import settings
 from models import Direction, LayerStatus
 from core.exchange_client import exchange_client
+from core.timeframes import timeframe_to_timedelta, closed_candles_until
 from trade_outcome import evaluate_trade_path, OPEN_EXPIRED
 from setup_identity import build_setup_id
 from layers import (
@@ -98,6 +99,7 @@ def _simulate_outcome(df_outcome_full: pd.DataFrame, signal_ts: pd.Timestamp, di
     juga dipakai outcome_tracker.py (live), supaya backtest dan live tidak pernah punya
     definisi "win" yang berbeda (lihat ringkasan_perbaikan.md P0.2).
 
+    signal_ts       : waktu CLOSE candle structure tempat sinyal dibuat (bukan open time).
     df_outcome_full : OHLCV pada timeframe GRANULAR (settings.tf_outcome, mis. 15m),
     bukan df_structure_full (timeframe sinyal) - supaya urutan SL-vs-TP di dalam satu
     candle sinyal bisa dibedakan, bukan ditebak.
@@ -106,8 +108,13 @@ def _simulate_outcome(df_outcome_full: pd.DataFrame, signal_ts: pd.Timestamp, di
     ini terlalu dekat dengan ujung dataset) - caller sebaiknya skip signal ini, jangan
     dicatat dengan outcome yang tidak valid.
     """
+    # `signal_ts` = waktu CLOSE candle structure (= saat sinyal benar-benar bisa dibuat, semua
+    # candle entry-nya sudah closed). Candle outcome yang BOLEH dicek = yang OPEN pada/setelah
+    # waktu itu (index >= signal_ts). Sebelumnya signal_ts = waktu OPEN candle structure dan
+    # filter `index > signal_ts`, sehingga candle-candle 5M di DALAM candle structure yang sama
+    # (yang sudah dipakai untuk menghitung entry/SL) ikut dipakai menentukan outcome -> look-ahead.
     window_end = signal_ts + pd.Timedelta(hours=MAX_HOLDING_HOURS)
-    window = df_outcome_full[(df_outcome_full.index > signal_ts) & (df_outcome_full.index <= window_end)]
+    window = df_outcome_full[(df_outcome_full.index >= signal_ts) & (df_outcome_full.index <= window_end)]
 
     return evaluate_trade_path(
         window, direction.value, entry, sl, tp1, tp2, tp3,
@@ -151,18 +158,35 @@ def simulate_symbol(symbol: str, df_htf_full: pd.DataFrame, df_structure_full: p
 
     df_entry_full : OHLCV timeframe ENTRY (default 15m, settings.tf_entry) - dipakai Layer
     5/6/7/8 persis seperti raw_data["ohlcv_entry"] di live pipeline (lihat config.py P1 -
-    Pisahkan Timeframe), di-slice sampai timestamp CANDLE STRUCTURE saat ini saja (tidak
-    boleh mengintip candle entry yang closed-nya setelah candle structure ini closed).
+    Pisahkan Timeframe), di-slice berdasarkan waktu CLOSE: hanya candle entry yang sudah
+    closed pada saat candle structure ini closed (open + TF entry <= open structure + TF
+    structure). Sinyal dianggap dibuat pada waktu close candle structure itu (`generated_at`).
     """
     records = []
     i = WARMUP_BARS
     n = len(df_structure_full)
 
+    # Timestamp OHLCV = waktu OPEN candle. Semua slicing antar-timeframe dilakukan berdasarkan
+    # waktu CLOSE, supaya set candle yang dilihat backtest = PERSIS set candle CLOSED yang
+    # dilihat pipeline live pada saat candle structure ini selesai (lihat core/timeframes.py):
+    #     structure_close_time = structure_open_time + durasi TF structure
+    #     df_entry = candle entry dengan (open + durasi TF entry) <= structure_close_time
+    # Filter lama `index <= structure_open_time` hanya meloloskan candle entry yang OPEN-nya
+    # <= awal candle structure (mis. 11:00), membuang 11:15/11:30/11:45 yang sebenarnya sudah
+    # closed saat candle 1H 11:00 selesai pukul 12:00 - RSI/MACD/volume/displacement/entry price
+    # jadi tergeser sampai satu jam dari live. Hal yang sama berlaku untuk TF HTF/BTC (kebalikan-
+    # nya: filter lama meloloskan candle 4H yang MASIH berjalan = look-ahead).
+    structure_delta = timeframe_to_timedelta(settings.tf_structure)
+    entry_delta = timeframe_to_timedelta(settings.tf_entry)
+    htf_delta = timeframe_to_timedelta(settings.tf_htf)
+
     while i < n - 1:
         df_structure = df_structure_full.iloc[: i + 1]
-        current_ts = df_structure.index[-1]
-        df_htf = df_htf_full[df_htf_full.index <= current_ts]
-        df_entry = df_entry_full[df_entry_full.index <= current_ts]
+        structure_open_time = df_structure.index[-1]
+        structure_close_time = structure_open_time + structure_delta
+        current_ts = structure_close_time  # waktu sinyal dibuat = saat candle structure closed
+        df_htf = closed_candles_until(df_htf_full, htf_delta, structure_close_time)
+        df_entry = closed_candles_until(df_entry_full, entry_delta, structure_close_time)
 
         if len(df_htf) < 210 or len(df_structure) < WARMUP_BARS or len(df_entry) < ENTRY_WARMUP_BARS:
             i += 1
@@ -195,7 +219,7 @@ def simulate_symbol(symbol: str, df_htf_full: pd.DataFrame, df_structure_full: p
 
         btc_slice = None
         if btc_htf_full is not None:
-            btc_slice = btc_htf_full[btc_htf_full.index <= current_ts]
+            btc_slice = closed_candles_until(btc_htf_full, htf_delta, structure_close_time)
         btc_passed, btc_direction = _check_btc_regime(direction, btc_slice)
         if not btc_passed:
             i += 1
@@ -274,8 +298,12 @@ def simulate_symbol(symbol: str, df_htf_full: pd.DataFrame, df_structure_full: p
 
         # satu posisi per symbol pada satu waktu - loncat ke bar mtf pertama SETELAH
         # trade ini closed (bukan +1 candle tetap), supaya tidak overlap dgn trade berikutnya.
+        # closed_at = waktu OPEN candle outcome tempat trade closed -> trade benar-benar selesai
+        # saat candle itu CLOSE. Bar structure berikutnya yang boleh menghasilkan sinyal baru =
+        # yang CLOSE-nya >= waktu itu (open_structure + durasi TF structure >= exit_close).
         closed_dt = pd.Timestamp(outcome_result.closed_at)
-        next_i = int(df_structure_full.index.searchsorted(closed_dt, side="right"))
+        exit_close = closed_dt + timeframe_to_timedelta(settings.tf_outcome)
+        next_i = int(df_structure_full.index.searchsorted(exit_close - structure_delta, side="left"))
         i = max(next_i, i + 1)
 
     return records

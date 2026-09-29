@@ -33,12 +33,39 @@ Location -> 15M Trigger):
   audit di layers/layer8_risk_management.py).
 Displacement, confirmation, DAN context SAMA-SAMA harus terpenuhi (skema: 15M displacement
 -> 15M close confirmation -> konteks SMC 1H -> ENTRY, bukan cuma sebagian).
+
+URUTAN WAKTU (perbaikan P0 - anti look-ahead)
+----------------------------------------------
+Urutan kausal yang HARUS benar, dan sekarang DIPAKSA oleh kode (bukan cuma diasumsikan):
+
+    zona/sweep 1H terbentuk & sudah CLOSED -> harga masuk/retest zona (context window)
+        -> displacement 15M -> confirmation 15M (candle terakhir) -> entry
+
+1. Context window dan displacement window TIDAK BOLEH overlap. Window layout (n = jumlah
+   candle context, d = jumlah candle displacement):
+       df_entry.iloc[-(n + d):-d]   = context window      C1 C2 C3
+       df_entry.iloc[-d:]           = displacement window              C4 C5 C6
+   Sebelumnya context = iloc[-n:] dan displacement = iloc[-d:] saling menimpa (C4-C6 masuk
+   keduanya), sehingga "harga menyentuh zona lalu displacement" bisa terlapor padahal
+   displacement-nya yang lebih dulu terjadi.
+2. OB/FVG hanya sah jadi context kalau SUDAH TERSEDIA sebelum context window mulai:
+       zone_available_at <= context_window_start
+   `zone_available_at` = waktu CLOSE candle structure yang membuat zona itu bisa diketahui
+   (open time + durasi TF structure; untuk OB = candle terakhir yang dibutuhkan displacement/
+   BOS-nya, bukan cuma candle OB). Timestamp OHLCV adalah waktu OPEN, jadi membandingkan
+   open time saja akan meloloskan zona dari candle 1H yang masih berjalan (look-ahead).
+   Kedekatan harga saja TIDAK cukup - urutan waktu wajib benar.
+3. Liquidity sweep memakai `meta["sweep_event_at"]` (candle yang menyapu) dan
+   `meta["reclaim_at"]` dari Layer 4 - BUKAN waktu swing yang disapu. Urutannya:
+   candle sweep closed -> reclaim closed -> displacement window mulai
+   (sweep -> reaksi/reclaim -> displacement). Lihat `_sweep_precedes_displacement()`.
 """
 
 import pandas as pd
 
 from models import LayerResult, LayerStatus, Direction
 from config import settings
+from core.timeframes import timeframe_to_timedelta
 
 CTX_ORDER_BLOCK = "order_block"
 CTX_FVG = "fvg"
@@ -108,19 +135,57 @@ def _range_overlaps_zone(low: float, high: float, zone) -> bool:
     return low <= zone.top and high >= zone.bottom
 
 
+def _to_utc_timestamp(value) -> pd.Timestamp | None:
+    """Parse ISO string/Timestamp jadi Timestamp UTC (tz-aware). None kalau kosong/tidak valid."""
+    if value is None or value == "":
+        return None
+    try:
+        ts = pd.Timestamp(value)
+    except Exception:
+        return None
+    if pd.isna(ts):
+        return None
+    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+
+def _zone_available_at(zone, structure_delta: pd.Timedelta) -> pd.Timestamp | None:
+    """
+    Waktu zona (OB/FVG) TERSEDIA = close candle structure terakhir yang dibutuhkan untuk
+    menyatakannya valid. Diambil dari yang PALING AKHIR antara `formed_at` dan
+    `meta["ready_candle_at"]` (Layer 4: untuk OB = akhir displacement/BOS, untuk FVG =
+    candle ketiga), lalu + durasi TF structure karena timestamp adalah waktu OPEN candle.
+    None kalau tidak bisa ditentukan -> pemanggil harus MENOLAK zona (fail-safe).
+    """
+    candidates = [
+        _to_utc_timestamp(getattr(zone, "formed_at", None)),
+        _to_utc_timestamp((getattr(zone, "meta", None) or {}).get("ready_candle_at")),
+    ]
+    candidates = [c for c in candidates if c is not None]
+    if not candidates:
+        return None
+    return max(candidates) + structure_delta
+
+
+def _sweep_event_time(sweep) -> pd.Timestamp | None:
+    """Timestamp candle yang benar-benar MENYAPU level (meta['sweep_event_at']). Bukan waktu swing/pool."""
+    return _to_utc_timestamp((sweep.meta or {}).get("sweep_event_at"))
+
+
 def _sweep_is_fresh(raw_data: dict, sweep) -> bool:
     """
-    True kalau umur `sweep` (dalam jumlah candle STRUCTURE/1H sejak terbentuk sampai candle
-    structure terakhir yang tersedia) masih di dalam batas settings.trigger_context_sweep_max_age_bars
-    - sweep yang sudah terlalu lama tidak lagi dianggap penyebab pergerakan 15M sekarang.
+    True kalau umur `sweep` (dalam jumlah candle STRUCTURE/1H sejak candle SWEEP-nya sampai
+    candle structure terakhir yang tersedia) masih di dalam batas
+    settings.trigger_context_sweep_max_age_bars - sweep yang sudah terlalu lama tidak lagi
+    dianggap penyebab pergerakan 15M sekarang. Umur dihitung dari `sweep_event_at` (kapan
+    sweep TERJADI), bukan dari waktu swing yang disapu.
     Kalau umur tidak bisa dihitung (data tidak lengkap), anggap TIDAK segar (fail-safe: lebih
     baik menolak context yang tidak bisa diverifikasi daripada menerimanya diam-diam).
     """
     df_structure = raw_data.get("ohlcv_structure")
-    if df_structure is None or not sweep.formed_at or not isinstance(df_structure.index, pd.DatetimeIndex):
+    sweep_ts = _sweep_event_time(sweep)
+    if df_structure is None or sweep_ts is None or not isinstance(df_structure.index, pd.DatetimeIndex):
         return False
     try:
-        sweep_ts = pd.Timestamp(sweep.formed_at)
         pos = df_structure.index.searchsorted(sweep_ts)
         age_bars = (len(df_structure.index) - 1) - pos
     except Exception:
@@ -128,57 +193,124 @@ def _sweep_is_fresh(raw_data: dict, sweep) -> bool:
     return 0 <= age_bars <= settings.trigger_context_sweep_max_age_bars
 
 
-def _find_smc_context(raw_data: dict, direction: Direction, df_entry) -> dict | None:
+def _sweep_precedes_displacement(sweep, structure_delta: pd.Timedelta,
+                                  displacement_start: pd.Timestamp) -> bool:
+    """
+    Urutan sweep -> reaksi (reclaim) -> displacement: candle sweep sudah CLOSED, candle
+    reclaim sudah CLOSED, dan keduanya selesai SEBELUM (<=) candle displacement pertama
+    dibuka. Timestamp Layer 4 = waktu OPEN candle 1H, jadi ditambah durasi TF structure
+    untuk mendapat waktu close-nya. Kalau timeline tidak lengkap -> False (fail-safe).
+    """
+    event_at = _sweep_event_time(sweep)
+    reclaim_at = _to_utc_timestamp((sweep.meta or {}).get("reclaim_at"))
+    if event_at is None or reclaim_at is None or reclaim_at < event_at:
+        return False
+    return (event_at + structure_delta) <= displacement_start and \
+           (reclaim_at + structure_delta) <= displacement_start
+
+
+def _split_windows(df_entry):
+    """
+    Pisahkan candle entry jadi (context_window, displacement_window) TANPA overlap:
+        context      = df_entry.iloc[-(context_n + disp_n):-disp_n]
+        displacement = df_entry.iloc[-disp_n:]
+    Return None kalau data tidak cukup / index bukan DatetimeIndex (urutan waktu tidak bisa
+    diverifikasi -> tidak ada context, fail-safe).
+    """
+    context_n = max(1, int(settings.trigger_context_lookback_bars))
+    disp_n = max(1, int(settings.entry_displacement_lookback_bars))
+    if not isinstance(df_entry.index, pd.DatetimeIndex) or len(df_entry) < context_n + disp_n:
+        return None
+    context_window = df_entry.iloc[-(context_n + disp_n):-disp_n]
+    displacement_window = df_entry.iloc[-disp_n:]
+    if context_window.empty or displacement_window.empty:
+        return None
+    # Guard eksplisit: context harus benar-benar berakhir SEBELUM displacement mulai.
+    if not context_window.index[-1] < displacement_window.index[0]:
+        return None
+    return context_window, displacement_window
+
+
+def _find_smc_context(raw_data: dict, direction: Direction, df_entry, diag: dict = None) -> dict | None:
     """
     Cari hubungan antara trigger 15M (entry-timeframe) dengan area SMC 1H (structure-
     timeframe) dari Layer 4 - Order Block / FVG / Liquidity Sweep. Lihat docstring modul di
-    atas untuk aturan lengkapnya. Return dict {"type", "zone", "detail"} kalau ketemu, None
-    kalau trigger ini tidak berhubungan dengan struktur 1H manapun.
+    atas untuk aturan lengkapnya. Return dict {"type", "zone", "detail", "timeline"} kalau
+    ketemu, None kalau trigger ini tidak berhubungan dengan struktur 1H manapun.
+
+    Urutan yang dipaksa (lihat "URUTAN WAKTU" di docstring modul):
+      OB/FVG : zone_available_at <= context_window_start  DAN  wick context window menyentuh zona
+      Sweep  : sweep closed -> reclaim closed -> displacement window mulai
+    `diag` (opsional, dict) diisi hitungan zona yang DITOLAK karena urutan waktu, untuk audit.
     """
-    lookback_bars = settings.trigger_context_lookback_bars
-    if len(df_entry) < lookback_bars + 1:
+    windows = _split_windows(df_entry)
+    if windows is None:
         return None
+    context_window, displacement_window = windows
 
-    window = df_entry.iloc[-lookback_bars:]
-    window_low = float(window["low"].min())
-    window_high = float(window["high"].max())
-    window_start_time = window.index[0] if isinstance(df_entry.index, pd.DatetimeIndex) else None
+    structure_delta = timeframe_to_timedelta(settings.tf_structure)
+    context_start = context_window.index[0]
+    context_end = context_window.index[-1]
+    displacement_start = displacement_window.index[0]
+    confirmation_at = df_entry.index[-1]
+    context_n = len(context_window)
 
-    for ob in raw_data.get("smc_active_obs", []) or []:
-        if ob.direction == direction and _range_overlaps_zone(window_low, window_high, ob):
+    window_low = float(context_window["low"].min())
+    window_high = float(context_window["high"].max())
+
+    timeline = {
+        "context_window_start": context_start.isoformat(),
+        "context_window_end": context_end.isoformat(),
+        "displacement_start": displacement_start.isoformat(),
+        "confirmation_at": confirmation_at.isoformat(),
+    }
+    rejected_temporal = 0
+
+    def _zone_candidates(key: str):
+        return [z for z in (raw_data.get(key, []) or []) if z.direction == direction]
+
+    for zone_type, key, label in ((CTX_ORDER_BLOCK, "smc_active_obs", "Order Block"),
+                                   (CTX_FVG, "smc_active_fvgs", "FVG")):
+        for zone in _zone_candidates(key):
+            if not _range_overlaps_zone(window_low, window_high, zone):
+                continue
+            available_at = _zone_available_at(zone, structure_delta)
+            if available_at is None or not available_at <= context_start:
+                # Harga menyentuh zona, tapi zona itu belum tersedia (belum closed/terkonfirmasi)
+                # saat context window dimulai -> BUKAN context (look-ahead). Proximity saja
+                # tidak cukup.
+                rejected_temporal += 1
+                continue
+            if diag is not None:
+                diag["zones_rejected_temporal"] = rejected_temporal
             return {
-                "type": CTX_ORDER_BLOCK, "zone": ob,
-                "detail": f"Window pendekatan 15M ({lookback_bars} candle) menyentuh Order "
-                          f"Block 1H @ {ob.bottom:.6g}-{ob.top:.6g}",
-            }
-
-    for fvg in raw_data.get("smc_active_fvgs", []) or []:
-        if fvg.direction == direction and _range_overlaps_zone(window_low, window_high, fvg):
-            return {
-                "type": CTX_FVG, "zone": fvg,
-                "detail": f"Window pendekatan 15M ({lookback_bars} candle) menyentuh FVG 1H "
-                          f"@ {fvg.bottom:.6g}-{fvg.top:.6g}",
+                "type": zone_type, "zone": zone,
+                "detail": f"Window pendekatan 15M ({context_n} candle) menyentuh {label} 1H "
+                          f"@ {zone.bottom:.6g}-{zone.top:.6g} (zona tersedia sejak {available_at.isoformat()})",
+                "timeline": {**timeline, "zone_available_at": available_at.isoformat()},
             }
 
     sweep = raw_data.get("liquidity_sweep_zone")
     if sweep is not None and sweep.direction == direction:
-        sweep_ts = None
-        try:
-            sweep_ts = pd.Timestamp(sweep.formed_at) if sweep.formed_at else None
-        except Exception:
-            sweep_ts = None
-        sweep_already_happened = (
-            sweep_ts is not None and window_start_time is not None and sweep_ts <= window_start_time
-        )
-        if sweep_already_happened and _sweep_is_fresh(raw_data, sweep):
+        if not _sweep_precedes_displacement(sweep, structure_delta, displacement_start):
+            rejected_temporal += 1
+        elif _sweep_is_fresh(raw_data, sweep):
             swept_level = sweep.meta.get("swept_level")
+            detail = (f"Trigger 15M terjadi setelah liquidity sweep 1H ({sweep.meta.get('sweep_type')}) "
+                      f"@ {swept_level:.6g} (sweep {sweep.meta.get('sweep_event_at')}, "
+                      f"reclaim {sweep.meta.get('reclaim_at')})") if swept_level \
+                else "Trigger 15M terjadi setelah liquidity sweep 1H"
+            if diag is not None:
+                diag["zones_rejected_temporal"] = rejected_temporal
             return {
-                "type": CTX_LIQUIDITY_SWEEP, "zone": sweep,
-                "detail": f"Trigger 15M terjadi setelah liquidity sweep 1H "
-                          f"({sweep.meta.get('sweep_type')}) @ {swept_level:.6g}" if swept_level
-                          else "Trigger 15M terjadi setelah liquidity sweep 1H",
+                "type": CTX_LIQUIDITY_SWEEP, "zone": sweep, "detail": detail,
+                "timeline": {**timeline,
+                              "sweep_event_at": sweep.meta.get("sweep_event_at"),
+                              "reclaim_at": sweep.meta.get("reclaim_at")},
             }
 
+    if diag is not None:
+        diag["zones_rejected_temporal"] = rejected_temporal
     return None
 
 
@@ -199,7 +331,8 @@ def run(raw_data: dict, direction: Direction, prior_layers_passed: bool) -> Laye
     breakout_confirm = _closed_beyond_recent_extreme(df_entry, direction)
     displacement_strength = _measure_entry_displacement(df_entry, direction)
     displacement_ok = displacement_strength >= settings.entry_displacement_min_atr_mult
-    context = _find_smc_context(raw_data, direction, df_entry)
+    context_diag = {}
+    context = _find_smc_context(raw_data, direction, df_entry, diag=context_diag)
     raw_data["trigger_context"] = context  # dipakai Layer 8 untuk SL - lihat audit di sana
 
     data = {
@@ -210,6 +343,10 @@ def run(raw_data: dict, direction: Direction, prior_layers_passed: bool) -> Laye
         "displacement_ok": displacement_ok,
         "context_type": context["type"] if context else None,
         "context_detail": context["detail"] if context else None,
+        # Timeline urutan waktu (context -> displacement -> confirmation) untuk audit/debug,
+        # dan jumlah zona yang DITOLAK karena urutan waktu (bukan karena harga tidak menyentuh).
+        "context_timeline": context.get("timeline") if context else None,
+        "context_zones_rejected_temporal": context_diag.get("zones_rejected_temporal", 0),
     }
 
     confirmation = pattern or breakout_confirm
